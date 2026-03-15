@@ -1,10 +1,21 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
+import epitran
 
 app = Flask(__name__)
 # Enable CORS so our Netlify site can talk to this API
 CORS(app)
+
+# Initialize the IPA generator for Russian (Cyrillic)
+# We do this globally so it only loads into memory once when the server starts
+print("Loading Russian IPA dictionary...")
+try:
+    epi = epitran.Epitran('rus-Cyrl')
+    print("Dictionary loaded!")
+except Exception as e:
+    print(f"Error loading epitran: {e}")
+    epi = None
 
 @app.route('/', methods=['GET'])
 def health_check():
@@ -19,11 +30,25 @@ def generate_ipa():
         
         text = data['text']
         
-        # TODO: Add actual russian-g2p logic here later!
-        # For now, we just return a fake test response to make sure the connection works.
-        test_response = f"✨ [API Connected!] You sent: {text[:20]}..."
+        if not epi:
+            return jsonify({"error": "IPA dictionary failed to load on the server."}), 500
+
+        # We split the text back into rows, translate each row, and rejoin
+        # This ensures the Grid Editor's line-by-line formatting stays intact
+        rows = text.split('\n')
+        ipa_rows = []
         
-        return jsonify({"ipa": test_response})
+        for row in rows:
+            if row.strip():
+                # Transliterate generates the IPA symbols
+                ipa_row = epi.transliterate(row)
+                ipa_rows.append(ipa_row)
+            else:
+                ipa_rows.append("") # Keep blank lines blank
+                
+        final_ipa_text = '\n'.join(ipa_rows)
+        
+        return jsonify({"ipa": final_ipa_text})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
