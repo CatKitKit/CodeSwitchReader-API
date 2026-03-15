@@ -7,15 +7,16 @@ app = Flask(__name__)
 # Enable CORS so our Netlify site can talk to this API
 CORS(app)
 
-# Initialize the IPA generator for Russian (Cyrillic)
+# Initialize the IPA generator for Russian and Arabic
 # We do this globally so it only loads into memory once when the server starts
-print("Loading Russian IPA dictionary...")
+print("Loading IPA dictionaries...")
+epi_instances = {}
 try:
-    epi = epitran.Epitran('rus-Cyrl')
-    print("Dictionary loaded!")
+    epi_instances['ru'] = epitran.Epitran('rus-Cyrl')
+    epi_instances['ar'] = epitran.Epitran('ara-Arab')
+    print("Dictionaries loaded!")
 except Exception as e:
     print(f"Error loading epitran: {e}")
-    epi = None
 
 @app.route('/', methods=['GET'])
 def health_check():
@@ -29,9 +30,11 @@ def generate_ipa():
             return jsonify({"error": "No text provided"}), 400
         
         text = data['text']
+        lang = data.get('lang', 'ru')  # Default to Russian for backward compatibility
         
+        epi = epi_instances.get(lang)
         if not epi:
-            return jsonify({"error": "IPA dictionary failed to load on the server."}), 500
+            return jsonify({"error": f"IPA dictionary for language '{lang}' failed to load or is not supported."}), 500
 
         # We split the text back into rows, translate each row, and rejoin
         # This ensures the Grid Editor's line-by-line formatting stays intact
