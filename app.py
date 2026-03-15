@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
 import epitran
+import eng_to_ipa
 
 app = Flask(__name__)
 # Enable CORS so our Netlify site can talk to this API
@@ -32,6 +33,18 @@ def generate_ipa():
         text = data['text']
         lang = data.get('lang', 'ru')  # Default to Russian for backward compatibility
         
+        if lang == 'en':
+            rows = text.split('\n')
+            ipa_rows = []
+            for row in rows:
+                if row.strip():
+                    ipa_row = eng_to_ipa.convert(row)
+                    ipa_rows.append(ipa_row)
+                else:
+                    ipa_rows.append("") # Keep blank lines blank
+            final_ipa_text = '\n'.join(ipa_rows)
+            return jsonify({"ipa": final_ipa_text})
+
         epi = epi_instances.get(lang)
         if not epi:
             return jsonify({"error": f"IPA dictionary for language '{lang}' failed to load or is not supported."}), 500
@@ -60,3 +73,4 @@ if __name__ == '__main__':
     # Render requires us to bind to 0.0.0.0 and use their provided PORT
     port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port)
+
