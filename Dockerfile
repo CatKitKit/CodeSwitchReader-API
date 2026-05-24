@@ -15,4 +15,4 @@ COPY . .
 
 # Run the app using gunicorn (the standard for production Python apps)
 # Bind to the PORT environment variable provided by Cloud Run
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "--threads", "8", "--timeout", "0", "app:app"]
+CMD exec gunicorn --bind :$PORT --workers 1 --threads 8 --timeout 0 app:app
