@@ -72,15 +72,14 @@ def ai_proxy():
         api_key = os.environ.get('GEMINI_API_KEY')
         if not api_key:
             return jsonify({"error": "API key not configured on server"}), 500
-        
+
         payload = request.get_json()
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-preview:generateContent?key={api_key}"
-        
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key={api_key}"
+
         response = requests.post(url, json=payload)
         return jsonify(response.json())
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
 @app.route('/ai-context', methods=['POST'])
 def ai_context():
     try:
