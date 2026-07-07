@@ -45,7 +45,7 @@ MAX_BODY_BYTES = 50 * 1024
 # In-memory rate limiting is deliberate: gunicorn runs 1 worker (8 threads
 # share this process), so no Redis needed at this scale.
 RATE_WINDOW_SECS = 60
-RATE_MAX_PER_WINDOW = 30      # per-IP sliding window
+RATE_MAX_PER_WINDOW = 15      # per-IP sliding window (matches Gemini free-tier RPM; Kit's call 2026-07-07)
 DAILY_MAX = 5000              # global circuit breaker (protects the Gemini quota)
 _rate_lock = threading.Lock()
 _ip_hits = {}                 # ip -> [timestamps within the window]
