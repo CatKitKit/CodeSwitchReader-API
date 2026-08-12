@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
 import hmac
+import html
 import json
 import re
 import time
@@ -13,6 +14,7 @@ except ImportError:
     print("WARNING: epitran is not installed. Russian/Arabic IPA will not work locally.")
     EPITRAN_AVAILABLE = False
 import requests
+from requests.adapters import TimeoutSauce
 from dotenv import load_dotenv
 
 # Load environment variables from .env file for local testing
@@ -41,8 +43,20 @@ CORS(app, origins=[
 APP_KEY = os.environ.get('APP_KEY', '')
 
 # Only the payload shapes mobile.js actually sends. Model stays server-side.
-ALLOWED_PAYLOAD_KEYS = {"contents", "systemInstruction", "generationConfig"}
+AI_CONTEXT_PURPOSE = "context_explanation"
+ALLOWED_PAYLOAD_KEYS = {
+    "contents", "systemInstruction", "generationConfig", "purpose"
+}
 MAX_BODY_BYTES = 50 * 1024
+
+# AI Context explanations alone use the slower, quality-first provider chain. The
+# phone marks only that request; summaries, Studios, lessons, and translations keep
+# the ordinary Gemini-only /ai-proxy path below.
+CONTEXT_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+CONTEXT_OPENROUTER_PROVIDER = "venice"
+CONTEXT_OPENROUTER_MODEL = "google/gemma-4-31b-it"
+CONTEXT_GEMINI_MODEL = "gemini-3.5-flash-lite"
+CONTEXT_PROVIDER_TIMEOUT_SECS = 18
 
 # The popup dictionary gets a separate, deliberately tiny contract. The phone sends
 # linguistic fields only; prompt construction and model/provider choice stay here.
@@ -280,6 +294,242 @@ def _gemini_dict_lookup(api_key, system, prompt):
     return _normalized_dict_text(text)
 
 
+def _context_request_payload(payload):
+    """Return the Gemini-shaped payload for a marked explanation, else None."""
+    if payload.get("purpose") != AI_CONTEXT_PURPOSE:
+        return None
+    if set(payload) != {"contents", "generationConfig", "purpose"}:
+        return None
+    contents = payload.get("contents")
+    generation = payload.get("generationConfig")
+    if (not isinstance(contents, list) or len(contents) != 1
+            or not isinstance(generation, dict)
+            or generation.get("responseMimeType") != "application/json"):
+        return None
+    parts = contents[0].get("parts") if isinstance(contents[0], dict) else None
+    if (not isinstance(parts, list) or len(parts) != 1
+            or not isinstance(parts[0], dict)
+            or not isinstance(parts[0].get("text"), str)
+            or not parts[0]["text"].strip()):
+        return None
+    return {key: value for key, value in payload.items() if key != "purpose"}
+
+
+def _context_request_timeout():
+    # Timeout carries per-request state inside urllib3; never share one instance across
+    # Cloud Run's eight request threads.
+    return TimeoutSauce(total=CONTEXT_PROVIDER_TIMEOUT_SECS, connect=3.05)
+
+
+def _context_contract_json(raw_text):
+    """Recover one JSON object, then enforce the three-field explanation contract."""
+    if not isinstance(raw_text, str):
+        return None
+    # Direct Gemma historically returned thought parts before the final part. OpenRouter
+    # normally exposes reasoning separately, but tolerate providers that inline it.
+    text = re.sub(
+        r"<(?:think|analysis)>[\s\S]*?</(?:think|analysis)>",
+        "",
+        raw_text,
+        flags=re.I,
+    )
+    text = re.sub(r"```(?:json)?", "", text, flags=re.I).strip()
+    start = text.find("{")
+    if start < 0:
+        return None
+
+    # Try successively earlier closing braces. This repairs the observed extra-tail-brace
+    # shape without inventing missing content or accepting a truncated object.
+    end = text.rfind("}")
+    parsed = None
+    while end >= start:
+        try:
+            candidate = json.loads(text[start:end + 1])
+            if isinstance(candidate, dict):
+                parsed = candidate
+                break
+        except (TypeError, ValueError):
+            pass
+        end = text.rfind("}", start, end)
+    if parsed is None:
+        return None
+
+    required = ("translation", "explainHtml", "examplesHtml")
+    if any(not isinstance(parsed.get(field), str) or not parsed[field].strip()
+           for field in required):
+        return None
+    # Tags alone are not usable explanation content and would become a blank cached
+    # success in the WebView. Keep entities as content but remove markup for this check.
+    if any(not html.unescape(re.sub(r"<[^>]*>", "", parsed[field])).strip()
+           for field in required):
+        return None
+    clean = {field: parsed[field].strip() for field in required}
+    return json.dumps(clean, ensure_ascii=False, separators=(",", ":"))
+
+
+def _context_envelope(contract_json):
+    # Keep the Gemini response shape mobile.js already consumes.
+    return {
+        "candidates": [{
+            "content": {"parts": [{"text": contract_json}]},
+            "finishReason": "STOP",
+        }]
+    }
+
+
+def _openrouter_context_response(api_key, prompt):
+    payload = {
+        "model": CONTEXT_OPENROUTER_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "response_format": {"type": "json_object"},
+        "max_tokens": 1000,
+        "stream": False,
+        "provider": {
+            "only": [CONTEXT_OPENROUTER_PROVIDER],
+            "order": [CONTEXT_OPENROUTER_PROVIDER],
+            "allow_fallbacks": False,
+            "zdr": True,
+            "data_collection": "deny",
+        },
+    }
+    return requests.post(
+        CONTEXT_OPENROUTER_URL,
+        headers={"Authorization": f"Bearer {api_key}"},
+        json=payload,
+        timeout=_context_request_timeout(),
+    )
+
+
+def _gemini_context_response(api_key, payload):
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{CONTEXT_GEMINI_MODEL}:generateContent"
+    )
+    gemini_payload = dict(payload)
+    generation = dict(gemini_payload.get("generationConfig") or {})
+    generation["thinkingConfig"] = {"thinkingLevel": "minimal"}
+    gemini_payload["generationConfig"] = generation
+    return requests.post(
+        url,
+        headers={"x-goog-api-key": api_key},
+        json=gemini_payload,
+        timeout=_context_request_timeout(),
+    )
+
+
+def _openrouter_context_contract(response):
+    try:
+        data = response.json()
+    except (TypeError, ValueError):
+        return None
+    choices = data.get("choices") if isinstance(data, dict) else None
+    choice = choices[0] if isinstance(choices, list) and choices else None
+    if not isinstance(choice, dict) or choice.get("finish_reason") != "stop":
+        return None
+    message = choice.get("message")
+    # Deliberately ignore message.reasoning/reasoning_details. Only final content is data.
+    content = message.get("content") if isinstance(message, dict) else None
+    return _context_contract_json(content)
+
+
+def _gemini_context_contract(response):
+    try:
+        data = response.json()
+    except (TypeError, ValueError):
+        return None
+    candidates = data.get("candidates") if isinstance(data, dict) else None
+    candidate = candidates[0] if isinstance(candidates, list) and candidates else None
+    if not isinstance(candidate, dict) or candidate.get("finishReason") != "STOP":
+        return None
+    content = candidate.get("content")
+    parts = content.get("parts", []) if isinstance(content, dict) else []
+    if not isinstance(parts, list):
+        return None
+    final_text = "".join(
+        part.get("text", "") for part in parts
+        if isinstance(part, dict) and not part.get("thought")
+    )
+    return _context_contract_json(final_text)
+
+
+def _ai_context_explanation(payload):
+    # The phone owns cancellation/stale UI with AbortController + request ids. This
+    # synchronous Flask handler cannot reliably observe that the client disconnected,
+    # so an already-running Venice request may still proceed to Gemini and incur cost;
+    # preventing that would require a queued/asynchronous backend architecture.
+    gemini_payload = _context_request_payload(payload)
+    if gemini_payload is None:
+        return jsonify({"error": "Bad request"}), 400
+
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    if not openrouter_key:
+        # A missing/invalid primary credential is a configuration error, not a reason
+        # to silently change providers.
+        return jsonify({"error": "Server not configured"}), 503
+
+    prompt = gemini_payload["contents"][0]["parts"][0]["text"]
+    should_fallback = False
+    try:
+        response = _openrouter_context_response(openrouter_key, prompt)
+        if response.status_code == 200:
+            contract = _openrouter_context_contract(response)
+            if contract:
+                return jsonify(_context_envelope(contract))
+            should_fallback = True
+            app.logger.warning("ai-context provider=venice unusable response")
+        elif response.status_code == 429 or response.status_code >= 500:
+            should_fallback = True
+            app.logger.warning(
+                "ai-context provider=venice status=%s", response.status_code
+            )
+        else:
+            # 400/401/403 and every other client/configuration response surface now.
+            status = response.status_code if 400 <= response.status_code < 500 else 502
+            return jsonify({"error": "AI context provider rejected request"}), status
+    except requests.Timeout:
+        should_fallback = True
+        app.logger.warning("ai-context provider=venice timeout")
+    except requests.RequestException:
+        app.logger.warning("ai-context provider=venice request failed")
+        return jsonify({"error": "Upstream error"}), 502
+    except Exception:
+        app.logger.exception("ai-context provider=venice failure")
+        return jsonify({"error": "Upstream error"}), 502
+
+    if not should_fallback:
+        return jsonify({"error": "AI context unavailable"}), 502
+    if not gemini_key:
+        return jsonify({"error": "Server not configured"}), 503
+
+    try:
+        response = _gemini_context_response(gemini_key, gemini_payload)
+        if response.status_code != 200:
+            app.logger.warning(
+                "ai-context provider=gemini status=%s", response.status_code
+            )
+            status = (
+                response.status_code
+                if 400 <= response.status_code < 500
+                else 502
+            )
+            return jsonify({"error": "AI context unavailable"}), status
+        contract = _gemini_context_contract(response)
+        if not contract:
+            app.logger.warning("ai-context provider=gemini unusable response")
+            return jsonify({"error": "AI context unavailable"}), 502
+        return jsonify(_context_envelope(contract))
+    except requests.Timeout:
+        app.logger.warning("ai-context provider=gemini timeout")
+        return jsonify({"error": "Upstream timeout"}), 502
+    except requests.RequestException:
+        app.logger.warning("ai-context provider=gemini request failed")
+        return jsonify({"error": "Upstream error"}), 502
+    except Exception:
+        app.logger.exception("ai-context provider=gemini failure")
+        return jsonify({"error": "Upstream error"}), 502
+
+
 # Initialize the IPA generator for Russian and Arabic
 # We do this globally so it only loads into memory once when the server starts
 print("Loading IPA dictionaries...")
@@ -354,6 +604,9 @@ def ai_proxy():
             or 'contents' not in payload
             or not set(payload).issubset(ALLOWED_PAYLOAD_KEYS)):
         return jsonify({"error": "Bad request"}), 400
+
+    if "purpose" in payload:
+        return _ai_context_explanation(payload)
 
     api_key = os.environ.get('GEMINI_API_KEY')
     if not api_key:
