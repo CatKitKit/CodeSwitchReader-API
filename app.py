@@ -52,11 +52,17 @@ MAX_BODY_BYTES = 50 * 1024
 # AI Context explanations alone use the slower, quality-first provider chain. The
 # phone marks only that request; summaries, Studios, lessons, and translations keep
 # the ordinary Gemini-only /ai-proxy path below.
+GEMINI_FLASH_LITE_MODEL = "gemini-3.5-flash-lite"
 CONTEXT_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 CONTEXT_OPENROUTER_PROVIDER = "venice"
 CONTEXT_OPENROUTER_MODEL = "google/gemma-4-31b-it"
-CONTEXT_GEMINI_MODEL = "gemini-3.5-flash-lite"
+CONTEXT_GEMINI_MODEL = GEMINI_FLASH_LITE_MODEL
 CONTEXT_PROVIDER_TIMEOUT_SECS = 18
+# Ordinary development can avoid OpenRouter charges entirely. Set this Cloud Run
+# variable to "venice" for the benchmarked Venice -> Gemini launch chain.
+AI_CONTEXT_MODE_ENV = "AI_CONTEXT_MODE"
+AI_CONTEXT_MODES = {"gemini", "venice"}
+AI_CONTEXT_DEFAULT_MODE = "gemini"
 
 # The popup dictionary gets a separate, deliberately tiny contract. The phone sends
 # linguistic fields only; prompt construction and model/provider choice stay here.
@@ -68,7 +74,7 @@ DICT_OPENROUTER_CANDIDATES = (
     ("deepinfra", "google/gemma-4-26b-a4b-it"),
     ("modelrun", "google/gemma-4-31b-it"),
 )
-DICT_GEMINI_MODEL = "gemini-3.5-flash-lite"
+DICT_GEMINI_MODEL = GEMINI_FLASH_LITE_MODEL
 
 # In-memory rate limiting is deliberate: gunicorn runs 1 worker (8 threads
 # share this process), so no Redis needed at this scale.
@@ -452,6 +458,37 @@ def _gemini_context_contract(response):
     return _context_contract_json(final_text)
 
 
+def _serve_gemini_context(api_key, payload):
+    if not api_key:
+        return jsonify({"error": "Server not configured"}), 503
+    try:
+        response = _gemini_context_response(api_key, payload)
+        if response.status_code != 200:
+            app.logger.warning(
+                "ai-context provider=gemini status=%s", response.status_code
+            )
+            status = (
+                response.status_code
+                if 400 <= response.status_code < 500
+                else 502
+            )
+            return jsonify({"error": "AI context unavailable"}), status
+        contract = _gemini_context_contract(response)
+        if not contract:
+            app.logger.warning("ai-context provider=gemini unusable response")
+            return jsonify({"error": "AI context unavailable"}), 502
+        return jsonify(_context_envelope(contract))
+    except requests.Timeout:
+        app.logger.warning("ai-context provider=gemini timeout")
+        return jsonify({"error": "Upstream timeout"}), 502
+    except requests.RequestException:
+        app.logger.warning("ai-context provider=gemini request failed")
+        return jsonify({"error": "Upstream error"}), 502
+    except Exception:
+        app.logger.exception("ai-context provider=gemini failure")
+        return jsonify({"error": "Upstream error"}), 502
+
+
 def _ai_context_explanation(payload):
     # The phone owns cancellation/stale UI with AbortController + request ids. This
     # synchronous Flask handler cannot reliably observe that the client disconnected,
@@ -461,8 +498,18 @@ def _ai_context_explanation(payload):
     if gemini_payload is None:
         return jsonify({"error": "Bad request"}), 400
 
+    mode = os.environ.get(
+        AI_CONTEXT_MODE_ENV, AI_CONTEXT_DEFAULT_MODE
+    ).strip().lower()
+    if mode not in AI_CONTEXT_MODES:
+        app.logger.error("ai-context invalid mode=%r", mode)
+        return jsonify({"error": "Server not configured"}), 503
+
     openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    if mode == "gemini":
+        return _serve_gemini_context(gemini_key, gemini_payload)
+
     if not openrouter_key:
         # A missing/invalid primary credential is a configuration error, not a reason
         # to silently change providers.
@@ -499,35 +546,7 @@ def _ai_context_explanation(payload):
 
     if not should_fallback:
         return jsonify({"error": "AI context unavailable"}), 502
-    if not gemini_key:
-        return jsonify({"error": "Server not configured"}), 503
-
-    try:
-        response = _gemini_context_response(gemini_key, gemini_payload)
-        if response.status_code != 200:
-            app.logger.warning(
-                "ai-context provider=gemini status=%s", response.status_code
-            )
-            status = (
-                response.status_code
-                if 400 <= response.status_code < 500
-                else 502
-            )
-            return jsonify({"error": "AI context unavailable"}), status
-        contract = _gemini_context_contract(response)
-        if not contract:
-            app.logger.warning("ai-context provider=gemini unusable response")
-            return jsonify({"error": "AI context unavailable"}), 502
-        return jsonify(_context_envelope(contract))
-    except requests.Timeout:
-        app.logger.warning("ai-context provider=gemini timeout")
-        return jsonify({"error": "Upstream timeout"}), 502
-    except requests.RequestException:
-        app.logger.warning("ai-context provider=gemini request failed")
-        return jsonify({"error": "Upstream error"}), 502
-    except Exception:
-        app.logger.exception("ai-context provider=gemini failure")
-        return jsonify({"error": "Upstream error"}), 502
+    return _serve_gemini_context(gemini_key, gemini_payload)
 
 
 # Initialize the IPA generator for Russian and Arabic
@@ -612,7 +631,10 @@ def ai_proxy():
     if not api_key:
         return jsonify({"error": "Server not configured"}), 503
 
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent"
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_FLASH_LITE_MODEL}:generateContent"
+    )
     try:
         response = requests.post(
             url,

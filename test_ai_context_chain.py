@@ -50,6 +50,8 @@ def gemini_response(text=VALID_JSON, finish_reason="STOP", thought="private thou
 class AiContextChainTest(unittest.TestCase):
     def setUp(self):
         self.old_app_key = api.APP_KEY
+        self.old_context_mode = os.environ.get(api.AI_CONTEXT_MODE_ENV)
+        os.environ[api.AI_CONTEXT_MODE_ENV] = "venice"
         api.APP_KEY = "test-app-key"
         with api._rate_lock:
             api._ip_hits.clear()
@@ -65,6 +67,10 @@ class AiContextChainTest(unittest.TestCase):
 
     def tearDown(self):
         api.APP_KEY = self.old_app_key
+        if self.old_context_mode is None:
+            os.environ.pop(api.AI_CONTEXT_MODE_ENV, None)
+        else:
+            os.environ[api.AI_CONTEXT_MODE_ENV] = self.old_context_mode
 
     def post(self, payload=None):
         return self.client.post(
@@ -77,6 +83,34 @@ class AiContextChainTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         text = response.get_json()["candidates"][0]["content"]["parts"][0]["text"]
         self.assertEqual(json.loads(text), VALID_OBJECT)
+
+    @patch("app.requests.post")
+    def test_default_gemini_mode_bypasses_openrouter_entirely(self, post):
+        post.return_value = gemini_response()
+        with patch.dict(os.environ, {
+            "GEMINI_API_KEY": "gemini-test",
+        }, clear=True):
+            response = self.post()
+
+        self.assert_contract(response)
+        self.assertEqual(post.call_count, 1)
+        call = post.call_args
+        self.assertIn("gemini-3.5-flash-lite", call.args[0])
+        self.assertNotIn("openrouter.ai", call.args[0])
+        self.assertEqual(call.kwargs["headers"], {"x-goog-api-key": "gemini-test"})
+        self.assertNotIn("purpose", call.kwargs["json"])
+
+    @patch("app.requests.post")
+    def test_invalid_mode_fails_closed_before_any_provider_call(self, post):
+        with patch.dict(os.environ, {
+            "AI_CONTEXT_MODE": "surprise-provider",
+            "OPENROUTER_API_KEY": "or-test",
+            "GEMINI_API_KEY": "gemini-test",
+        }):
+            response = self.post()
+
+        self.assertEqual(response.status_code, 503)
+        post.assert_not_called()
 
     @patch("app.requests.post")
     def test_venice_success_is_strictly_pinned_private_and_gemini_shaped(self, post):
@@ -222,7 +256,10 @@ class AiContextChainTest(unittest.TestCase):
 
     @patch("app.requests.post")
     def test_missing_primary_configuration_does_not_silently_skip_to_gemini(self, post):
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "gemini-test"}, clear=True):
+        with patch.dict(os.environ, {
+            "AI_CONTEXT_MODE": "venice",
+            "GEMINI_API_KEY": "gemini-test",
+        }, clear=True):
             response = self.post()
         self.assertEqual(response.status_code, 503)
         post.assert_not_called()
@@ -296,7 +333,7 @@ class AiContextChainTest(unittest.TestCase):
             response = self.post(unmarked)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(post.call_count, 1)
-        self.assertIn("gemini-3.1-flash-lite", post.call_args.args[0])
+        self.assertIn("gemini-3.5-flash-lite", post.call_args.args[0])
         self.assertNotIn("openrouter.ai", post.call_args.args[0])
 
 
