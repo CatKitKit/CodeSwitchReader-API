@@ -5,6 +5,7 @@ import hmac
 import html
 import json
 import re
+import secrets
 import time
 import threading
 try:
@@ -76,6 +77,23 @@ DICT_OPENROUTER_CANDIDATES = (
 )
 DICT_GEMINI_MODEL = GEMINI_FLASH_LITE_MODEL
 
+# AI-output reports are an intentionally narrow safety channel, not a general
+# feedback inbox. The phone always sends the output; surrounding request text is
+# a separate, opt-in field. Records are written as structured Cloud Logging entries;
+# the production project's default bucket was verified at 30-day retention.
+REPORT_ALLOWED_PAYLOAD_KEYS = {
+    "category", "feature", "output", "note", "context", "appVersion"
+}
+REPORT_CATEGORIES = {"offensive", "incorrect", "other"}
+# 12k output + 6k optional context can exceed 24 KiB in CJK/emoji UTF-8 even
+# while staying inside the character caps. This still sits well below Cloud
+# Logging's per-entry limit.
+REPORT_MAX_BODY_BYTES = 96 * 1024
+REPORT_RATE_WINDOW_SECS = 10 * 60
+REPORT_RATE_MAX_PER_WINDOW = 5
+_report_rate_lock = threading.Lock()
+_report_ip_hits = {}
+
 # In-memory rate limiting is deliberate: gunicorn runs 1 worker (8 threads
 # share this process), so no Redis needed at this scale.
 RATE_WINDOW_SECS = 60
@@ -124,6 +142,65 @@ def _rate_limited():
                 if not any(t > cutoff for t in _ip_hits[k]):
                     del _ip_hits[k]
     return None
+
+
+def _report_rate_limited():
+    """Keep the reporting channel usable without charging the AI quota."""
+    now = time.time()
+    ip = _client_ip()
+    with _report_rate_lock:
+        hits = [
+            stamp for stamp in _report_ip_hits.get(ip, [])
+            if now - stamp < REPORT_RATE_WINDOW_SECS
+        ]
+        if len(hits) >= REPORT_RATE_MAX_PER_WINDOW:
+            _report_ip_hits[ip] = hits
+            return jsonify({"error": "Too many reports. Please try again later."}), 429
+        hits.append(now)
+        _report_ip_hits[ip] = hits
+        if len(_report_ip_hits) > 10000:
+            cutoff = now - REPORT_RATE_WINDOW_SECS
+            for key in list(_report_ip_hits):
+                if not any(stamp > cutoff for stamp in _report_ip_hits[key]):
+                    del _report_ip_hits[key]
+    return None
+
+
+def _clean_report_field(value, max_chars, required=False):
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if required and not value:
+        return None
+    if len(value) > max_chars:
+        return None
+    # Newlines and tabs are legitimate in generated stories and dialogue. Reject
+    # only control characters that cannot be meaningful report content.
+    if any((ord(char) < 32 and char not in "\n\r\t") or ord(char) == 127 for char in value):
+        return None
+    return value
+
+
+def _report_request_fields(payload):
+    if (not isinstance(payload, dict)
+            or set(payload) != REPORT_ALLOWED_PAYLOAD_KEYS
+            or payload.get("category") not in REPORT_CATEGORIES):
+        return None
+    feature = _clean_report_field(payload.get("feature"), 80, required=True)
+    output = _clean_report_field(payload.get("output"), 12000, required=True)
+    note = _clean_report_field(payload.get("note"), 2000)
+    context = _clean_report_field(payload.get("context"), 6000)
+    app_version = _clean_report_field(payload.get("appVersion"), 40, required=True)
+    if None in (feature, output, note, context, app_version):
+        return None
+    return {
+        "category": payload["category"],
+        "feature": feature,
+        "output": output,
+        "note": note,
+        "context": context,
+        "appVersion": app_version,
+    }
 
 
 def _clean_dict_field(value, max_chars):
@@ -722,6 +799,41 @@ def dict_fallback():
     if saw_sentinel:
         return jsonify({"text": DICT_SENTINEL, "found": False})
     return jsonify({"error": "Dictionary lookup unavailable"}), 502
+
+
+@app.route('/report-ai-output', methods=['POST'])
+def report_ai_output():
+    # Reports never call an AI provider. Authentication still prevents this endpoint
+    # from becoming a public log-writing primitive, and its rate limit is separate so
+    # reports cannot consume (or be blocked by) the generation quota.
+    if not APP_KEY:
+        return jsonify({"error": "Server not configured"}), 503
+    if not _authorized():
+        return jsonify({"error": "Unauthorized"}), 401
+    if (request.content_length or 0) > REPORT_MAX_BODY_BYTES:
+        return jsonify({"error": "Request too large"}), 413
+
+    fields = _report_request_fields(request.get_json(silent=True))
+    if not fields:
+        return jsonify({"error": "Bad request"}), 400
+    limited = _report_rate_limited()
+    if limited:
+        return limited
+
+    report_id = secrets.token_urlsafe(12)
+    record = {
+        "severity": "WARNING",
+        "message": "AI output report",
+        "eventType": "ai_output_report",
+        "reportId": report_id,
+        "receivedAt": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+        **fields,
+    }
+    # One valid JSON object on stdout becomes one structured Cloud Logging entry.
+    # Deliberately omit the request IP and all account/device identifiers. Cloud Run's
+    # ordinary request log may still contain network metadata under Google's controls.
+    print(json.dumps(record, ensure_ascii=False, separators=(',', ':')), flush=True)
+    return jsonify({"ok": True, "reportId": report_id}), 201
 
 
 # /ai-context was DELETED 2026-07-07: confirmed dead route (zero references in
