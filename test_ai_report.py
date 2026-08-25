@@ -11,6 +11,7 @@ class AiOutputReportTest(unittest.TestCase):
         api.APP_KEY = "test-app-key"
         with api._report_rate_lock:
             api._report_ip_hits.clear()
+            api._report_global_hits.clear()
         self.client = api.app.test_client()
         self.headers = {"X-App-Key": "test-app-key"}
         self.payload = {
@@ -52,6 +53,23 @@ class AiOutputReportTest(unittest.TestCase):
         self.assertNotIn("ip", record)
         self.assertNotIn("account", record)
         self.assertNotIn("deviceId", record)
+
+    def test_structured_record_write_uses_the_report_log_lock(self):
+        class RecordingLock:
+            def __init__(self):
+                self.held = False
+
+            def __enter__(self):
+                self.held = True
+
+            def __exit__(self, *_args):
+                self.held = False
+
+        lock = RecordingLock()
+        with patch.object(api, "_report_log_lock", lock), patch("builtins.print") as write_log:
+            write_log.side_effect = lambda *_args, **_kwargs: self.assertTrue(lock.held)
+            response = self.post()
+        self.assertEqual(response.status_code, 201)
 
     def test_context_and_note_may_be_empty(self):
         payload = {**self.payload, "context": "", "note": ""}
@@ -100,6 +118,24 @@ class AiOutputReportTest(unittest.TestCase):
             with patch("builtins.print"):
                 self.assertEqual(self.post().status_code, 201)
         self.assertEqual(self.post().status_code, 429)
+        self.assertEqual(len(api._report_global_hits), api.REPORT_RATE_MAX_PER_WINDOW)
+
+    def test_global_report_cap_survives_spoofed_ip_rotation(self):
+        with patch.object(api, "REPORT_GLOBAL_RATE_MAX_PER_WINDOW", 2):
+            for spoofed_ip in ("198.51.100.1", "198.51.100.2"):
+                with patch("builtins.print"):
+                    response = self.client.post(
+                        "/report-ai-output",
+                        json=self.payload,
+                        headers={**self.headers, "X-Forwarded-For": spoofed_ip},
+                    )
+                self.assertEqual(response.status_code, 201)
+            response = self.client.post(
+                "/report-ai-output",
+                json=self.payload,
+                headers={**self.headers, "X-Forwarded-For": "198.51.100.3"},
+            )
+            self.assertEqual(response.status_code, 429)
 
 
 if __name__ == "__main__":

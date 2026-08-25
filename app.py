@@ -91,8 +91,11 @@ REPORT_CATEGORIES = {"offensive", "incorrect", "other"}
 REPORT_MAX_BODY_BYTES = 96 * 1024
 REPORT_RATE_WINDOW_SECS = 10 * 60
 REPORT_RATE_MAX_PER_WINDOW = 5
+REPORT_GLOBAL_RATE_MAX_PER_WINDOW = 100
 _report_rate_lock = threading.Lock()
+_report_log_lock = threading.Lock()
 _report_ip_hits = {}
+_report_global_hits = []
 
 # In-memory rate limiting is deliberate: gunicorn runs 1 worker (8 threads
 # share this process), so no Redis needed at this scale.
@@ -149,6 +152,13 @@ def _report_rate_limited():
     now = time.time()
     ip = _client_ip()
     with _report_rate_lock:
+        global_hits = [
+            stamp for stamp in _report_global_hits
+            if now - stamp < REPORT_RATE_WINDOW_SECS
+        ]
+        _report_global_hits[:] = global_hits
+        if len(global_hits) >= REPORT_GLOBAL_RATE_MAX_PER_WINDOW:
+            return jsonify({"error": "Too many reports. Please try again later."}), 429
         hits = [
             stamp for stamp in _report_ip_hits.get(ip, [])
             if now - stamp < REPORT_RATE_WINDOW_SECS
@@ -158,6 +168,7 @@ def _report_rate_limited():
             return jsonify({"error": "Too many reports. Please try again later."}), 429
         hits.append(now)
         _report_ip_hits[ip] = hits
+        _report_global_hits.append(now)
         if len(_report_ip_hits) > 10000:
             cutoff = now - REPORT_RATE_WINDOW_SECS
             for key in list(_report_ip_hits):
@@ -832,7 +843,9 @@ def report_ai_output():
     # One valid JSON object on stdout becomes one structured Cloud Logging entry.
     # Deliberately omit the request IP and all account/device identifiers. Cloud Run's
     # ordinary request log may still contain network metadata under Google's controls.
-    print(json.dumps(record, ensure_ascii=False, separators=(',', ':')), flush=True)
+    # Keep print's payload + newline writes together across gunicorn's worker threads.
+    with _report_log_lock:
+        print(json.dumps(record, ensure_ascii=False, separators=(',', ':')), flush=True)
     return jsonify({"ok": True, "reportId": report_id}), 201
 
 
