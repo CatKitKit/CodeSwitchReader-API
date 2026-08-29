@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+import base64
 import os
 import hmac
 import html
@@ -97,6 +98,32 @@ _report_log_lock = threading.Lock()
 _report_ip_hits = {}
 _report_global_hits = []
 
+# Full-song generation is a separate paid boundary. The phone sends finalized
+# lyrics and a small set of musical choices; prompt construction and the model stay
+# server-side. The route fails closed until explicitly enabled in Cloud Run.
+SONG_GENERATION_ENABLED = os.environ.get(
+    "SONG_GENERATION_ENABLED", ""
+).strip().lower() in {"1", "true", "yes", "on"}
+SONG_MODEL = "lyria-3-pro-preview"
+SONG_INTERACTIONS_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/interactions"
+)
+SONG_ALLOWED_PAYLOAD_KEYS = {"lyrics", "targetLanguage", "style", "mood"}
+SONG_STYLES = {
+    "pop", "acoustic", "dance", "lullaby", "folk", "ballad", "rap", "marching"
+}
+SONG_MOODS = {
+    "upbeat", "tender", "dramatic", "playful", "wistful", "calm", "determined", "funny"
+}
+SONG_MAX_BODY_BYTES = 48 * 1024
+SONG_MAX_AUDIO_BYTES = 12 * 1024 * 1024
+SONG_RATE_WINDOW_SECS = 10 * 60
+SONG_RATE_MAX_PER_WINDOW = int(os.environ.get("SONG_RATE_MAX_PER_WINDOW", "2"))
+SONG_DAILY_MAX = int(os.environ.get("SONG_DAILY_MAX", "25"))
+_song_rate_lock = threading.Lock()
+_song_ip_hits = {}
+_song_daily = {"day": None, "count": 0}
+
 # In-memory rate limiting is deliberate: gunicorn runs 1 worker (8 threads
 # share this process), so no Redis needed at this scale.
 RATE_WINDOW_SECS = 60
@@ -177,6 +204,35 @@ def _report_rate_limited():
     return None
 
 
+def _song_rate_limited():
+    """Bound the paid music route independently from cheap text generation."""
+    now = time.time()
+    today = time.strftime('%Y-%m-%d')
+    ip = _client_ip()
+    with _song_rate_lock:
+        if _song_daily["day"] != today:
+            _song_daily["day"] = today
+            _song_daily["count"] = 0
+        if _song_daily["count"] >= SONG_DAILY_MAX:
+            return jsonify({"error": "Song limit reached. Please try again tomorrow."}), 429
+        hits = [
+            stamp for stamp in _song_ip_hits.get(ip, [])
+            if now - stamp < SONG_RATE_WINDOW_SECS
+        ]
+        if len(hits) >= SONG_RATE_MAX_PER_WINDOW:
+            _song_ip_hits[ip] = hits
+            return jsonify({"error": "Please wait before baking another song."}), 429
+        hits.append(now)
+        _song_ip_hits[ip] = hits
+        _song_daily["count"] += 1
+        if len(_song_ip_hits) > 10000:
+            cutoff = now - SONG_RATE_WINDOW_SECS
+            for key in list(_song_ip_hits):
+                if not any(stamp > cutoff for stamp in _song_ip_hits[key]):
+                    del _song_ip_hits[key]
+    return None
+
+
 def _clean_report_field(value, max_chars, required=False):
     if not isinstance(value, str):
         return None
@@ -212,6 +268,63 @@ def _report_request_fields(payload):
         "context": context,
         "appVersion": app_version,
     }
+
+
+def _song_request_fields(payload):
+    if (not isinstance(payload, dict)
+            or set(payload) != SONG_ALLOWED_PAYLOAD_KEYS
+            or payload.get("style") not in SONG_STYLES
+            or payload.get("mood") not in SONG_MOODS):
+        return None
+    lyrics = _clean_report_field(payload.get("lyrics"), 12000, required=True)
+    target_language = _clean_report_field(
+        payload.get("targetLanguage"), 64, required=True
+    )
+    if not lyrics or not target_language:
+        return None
+    return {
+        "lyrics": lyrics,
+        "targetLanguage": target_language,
+        "style": payload["style"],
+        "mood": payload["mood"],
+    }
+
+
+def _song_prompt(fields):
+    return (
+        f"Create an approximately 90-second {fields['mood']} {fields['style']} song "
+        f"for a learner of {fields['targetLanguage']}. Use warm, clearly articulated "
+        "vocals. Sing exactly the supplied lyrics: do not add, remove, translate, "
+        "repeat beyond the written repeats, or rewrite any lyric line. Treat the "
+        "square-bracketed section markers as structure, not words to sing. Do not "
+        "name or imitate a real artist.\n\n"
+        f"Lyrics:\n{fields['lyrics']}"
+    )
+
+
+def _song_audio_from_response(payload):
+    if not isinstance(payload, dict) or not isinstance(payload.get("steps"), list):
+        return None
+    for step in reversed(payload["steps"]):
+        if not isinstance(step, dict) or not isinstance(step.get("content"), list):
+            continue
+        for block in reversed(step["content"]):
+            if not isinstance(block, dict) or block.get("type") != "audio":
+                continue
+            encoded = block.get("data")
+            if not isinstance(encoded, str) or not encoded:
+                continue
+            try:
+                audio = base64.b64decode(encoded, validate=True)
+            except (ValueError, TypeError):
+                continue
+            if not audio or len(audio) > SONG_MAX_AUDIO_BYTES:
+                continue
+            mime_type = block.get("mime_type") or block.get("mimeType") or "audio/mpeg"
+            if mime_type not in {"audio/mpeg", "audio/mp3"}:
+                continue
+            return encoded, "audio/mpeg", len(audio)
+    return None
 
 
 def _clean_dict_field(value, max_chars):
@@ -741,6 +854,67 @@ def ai_proxy():
     except Exception:
         app.logger.exception("ai-proxy upstream failure")
         return jsonify({"error": "Upstream error"}), 502
+
+
+@app.route('/song-bake', methods=['POST'])
+def song_bake():
+    # This is the paid boundary, not another general prompt proxy. Keep the app key,
+    # launch switch, exact payload, and separate cost limit ahead of the Lyria call.
+    if not APP_KEY:
+        return jsonify({"error": "Server not configured"}), 503
+    if not _authorized():
+        return jsonify({"error": "Unauthorized"}), 401
+    if not SONG_GENERATION_ENABLED:
+        return jsonify({"error": "Song generation is not enabled"}), 503
+    if (request.content_length or 0) > SONG_MAX_BODY_BYTES:
+        return jsonify({"error": "Request too large"}), 413
+
+    fields = _song_request_fields(request.get_json(silent=True))
+    if not fields:
+        return jsonify({"error": "Bad request"}), 400
+    api_key = os.environ.get('GEMINI_API_KEY', '')
+    if not api_key:
+        return jsonify({"error": "Server not configured"}), 503
+    limited = _song_rate_limited()
+    if limited:
+        return limited
+
+    try:
+        response = requests.post(
+            SONG_INTERACTIONS_URL,
+            headers={"x-goog-api-key": api_key},
+            json={"model": SONG_MODEL, "input": _song_prompt(fields)},
+            timeout=(10, 120),
+        )
+        if response.status_code >= 400:
+            app.logger.warning(
+                "song-bake upstream rejected request status=%s",
+                response.status_code,
+            )
+            return jsonify({"error": "The music service refused this song"}), 502
+        audio = _song_audio_from_response(response.json())
+        if not audio:
+            app.logger.warning("song-bake upstream returned no usable MP3")
+            return jsonify({"error": "The music service returned no audio"}), 502
+        encoded, mime_type, byte_count = audio
+        return jsonify({
+            "audioBase64": encoded,
+            "mimeType": mime_type,
+            "bytes": byte_count,
+            "model": SONG_MODEL,
+        })
+    except requests.Timeout:
+        return jsonify({"error": "Song generation timed out"}), 504
+    except requests.RequestException:
+        app.logger.warning("song-bake upstream request failed")
+        return jsonify({"error": "Song generation is temporarily unavailable"}), 502
+    except (ValueError, TypeError):
+        app.logger.warning("song-bake upstream returned invalid JSON")
+        return jsonify({"error": "The music service returned an invalid response"}), 502
+    except Exception:
+        # Never log lyrics or the upstream response: both are user content.
+        app.logger.exception("song-bake upstream failure")
+        return jsonify({"error": "Song generation failed"}), 502
 
 
 @app.route('/dict-fallback', methods=['POST'])
