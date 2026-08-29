@@ -879,7 +879,9 @@ def song_bake():
     fields = _song_request_fields(request.get_json(silent=True))
     if not fields:
         return jsonify({"error": "Bad request"}), 400
-    api_key = os.environ.get('GEMINI_API_KEY', '')
+    # Keep paid music billing isolated from the text-generation key so either
+    # service can be rotated, capped, or disabled without affecting the other.
+    api_key = os.environ.get('LYRIA_API_KEY', '')
     if not api_key:
         return jsonify({"error": "Server not configured"}), 503
     limited = _song_rate_limited()

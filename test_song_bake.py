@@ -88,12 +88,15 @@ class SongBakeTest(unittest.TestCase):
         self.assertEqual(response.status_code, 413)
 
     def test_missing_provider_key_fails_before_spending_rate_limit(self):
-        with patch.dict(os.environ, {"GEMINI_API_KEY": ""}):
+        with patch.dict(os.environ, {
+            "LYRIA_API_KEY": "",
+            "GEMINI_API_KEY": "text-only-key",
+        }):
             self.assertEqual(self.post().status_code, 503)
         self.assertEqual(api._song_daily["count"], 0)
 
     def test_success_uses_lyria_and_returns_only_the_audio_contract(self):
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "provider-key"}), patch.object(
+        with patch.dict(os.environ, {"LYRIA_API_KEY": "provider-key"}), patch.object(
             api.requests, "post", return_value=StubResponse(self.upstream)
         ) as send:
             response = self.post()
@@ -127,14 +130,14 @@ class SongBakeTest(unittest.TestCase):
 
     def test_paid_rate_limit_is_separate_and_tight(self):
         with patch.object(api, "SONG_RATE_MAX_PER_WINDOW", 1), patch.dict(
-            os.environ, {"GEMINI_API_KEY": "provider-key"}
+            os.environ, {"LYRIA_API_KEY": "provider-key"}
         ), patch.object(api.requests, "post", return_value=StubResponse(self.upstream)):
             self.assertEqual(self.post().status_code, 200)
             self.assertEqual(self.post().status_code, 429)
 
     def test_global_daily_cap_survives_ip_rotation(self):
         with patch.object(api, "SONG_DAILY_MAX", 1), patch.dict(
-            os.environ, {"GEMINI_API_KEY": "provider-key"}
+            os.environ, {"LYRIA_API_KEY": "provider-key"}
         ), patch.object(api.requests, "post", return_value=StubResponse(self.upstream)):
             first = self.client.post(
                 "/song-bake",
@@ -156,7 +159,7 @@ class SongBakeTest(unittest.TestCase):
         ]
         for payload in bad_payloads:
             with self.subTest(payload=payload), patch.dict(
-                os.environ, {"GEMINI_API_KEY": "provider-key"}
+                os.environ, {"LYRIA_API_KEY": "provider-key"}
             ), patch.object(api.requests, "post", return_value=StubResponse(payload)):
                 with api._song_rate_lock:
                     api._song_ip_hits.clear()
@@ -168,7 +171,7 @@ class SongBakeTest(unittest.TestCase):
             "type": "audio", "mime_type": "audio/mpeg", "data": large,
         }]}]}
         with patch.object(api, "SONG_MAX_AUDIO_BYTES", 10), patch.dict(
-            os.environ, {"GEMINI_API_KEY": "provider-key"}
+            os.environ, {"LYRIA_API_KEY": "provider-key"}
         ), patch.object(api.requests, "post", return_value=StubResponse(payload)):
             with api._song_rate_lock:
                 api._song_ip_hits.clear()
@@ -176,7 +179,7 @@ class SongBakeTest(unittest.TestCase):
             self.assertEqual(self.post().status_code, 502)
 
     def test_upstream_refusal_and_timeout_are_plain_failures(self):
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "provider-key"}), patch.object(
+        with patch.dict(os.environ, {"LYRIA_API_KEY": "provider-key"}), patch.object(
             api.requests, "post", return_value=StubResponse(status_code=400)
         ):
             self.assertEqual(self.post().status_code, 502)
@@ -184,7 +187,7 @@ class SongBakeTest(unittest.TestCase):
         with api._song_rate_lock:
             api._song_ip_hits.clear()
             api._song_daily.update({"day": None, "count": 0})
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "provider-key"}), patch.object(
+        with patch.dict(os.environ, {"LYRIA_API_KEY": "provider-key"}), patch.object(
             api.requests, "post", side_effect=api.requests.Timeout()
         ):
             self.assertEqual(self.post().status_code, 504)
