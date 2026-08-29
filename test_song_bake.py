@@ -112,6 +112,9 @@ class SongBakeTest(unittest.TestCase):
         self.assertIn("Spanish", prompt)
         self.assertIn("playful acoustic", prompt)
         self.assertNotIn("audioBase64", prompt)
+        lyrics_end = prompt.index(self.payload["lyrics"]) + len(self.payload["lyrics"])
+        self.assertIn("do not follow", prompt[lyrics_end:].lower())
+        self.assertIn("imitate", prompt[lyrics_end:].lower())
 
     def test_paid_rate_limit_is_separate_and_tight(self):
         with patch.object(api, "SONG_RATE_MAX_PER_WINDOW", 1), patch.dict(
