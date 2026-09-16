@@ -109,6 +109,10 @@ SONG_INTERACTIONS_URL = (
     "https://generativelanguage.googleapis.com/v1beta/interactions"
 )
 SONG_ALLOWED_PAYLOAD_KEYS = {"lyrics", "targetLanguage", "style", "mood"}
+SONG_LANGUAGES = frozenset({
+    "English", "French", "German", "Hindi",
+    "Japanese", "Korean", "Portuguese", "Spanish",
+})
 SONG_STYLES = {
     "pop", "acoustic", "dance", "lullaby", "folk", "ballad", "rap", "marching"
 }
@@ -280,7 +284,7 @@ def _song_request_fields(payload):
     target_language = _clean_report_field(
         payload.get("targetLanguage"), 64, required=True
     )
-    if not lyrics or not target_language:
+    if not lyrics or target_language not in SONG_LANGUAGES:
         return None
     return {
         "lyrics": lyrics,

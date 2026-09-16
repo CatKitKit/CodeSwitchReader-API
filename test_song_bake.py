@@ -75,6 +75,36 @@ class SongBakeTest(unittest.TestCase):
             400,
         )
 
+    def test_launch_language_list_is_exact_and_every_language_is_accepted(self):
+        expected = {
+            "English", "French", "German", "Hindi",
+            "Japanese", "Korean", "Portuguese", "Spanish",
+        }
+        self.assertEqual(api.SONG_LANGUAGES, expected)
+        for language in expected:
+            with self.subTest(language=language):
+                fields = api._song_request_fields({
+                    **self.payload,
+                    "targetLanguage": language,
+                })
+                self.assertIsNotNone(fields)
+                self.assertEqual(fields["targetLanguage"], language)
+
+    def test_unsupported_or_malformed_languages_never_reach_or_spend_provider(self):
+        invalid = [
+            "Mandarin", "Russian", "Thai", "english", "English (US)",
+            "", None, {"name": "Spanish"}, ["Spanish"],
+        ]
+        with patch.dict(os.environ, {"LYRIA_API_KEY": "provider-key"}), patch.object(
+            api.requests, "post"
+        ) as send:
+            for language in invalid:
+                with self.subTest(language=language):
+                    response = self.post({**self.payload, "targetLanguage": language})
+                    self.assertEqual(response.status_code, 400)
+        send.assert_not_called()
+        self.assertEqual(api._song_daily["count"], 0)
+
     def test_rejects_oversized_utf8_before_parsing(self):
         response = self.client.post(
             "/song-bake",
