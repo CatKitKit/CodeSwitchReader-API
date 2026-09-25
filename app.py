@@ -9,6 +9,7 @@ import re
 import secrets
 import time
 import threading
+import unicodedata
 try:
     import epitran
     EPITRAN_AVAILABLE = True
@@ -348,6 +349,39 @@ def _clean_dict_field(value, max_chars):
     return value
 
 
+# Words and short phrases only, never sentences: the free dictionary must not become a
+# free translator. Mirrors the phone's `dictAiLookupTooLong` (mobile.js) — keep the
+# numbers in step. Vietnamese spaces every syllable; unspaced scripts count letters,
+# not tone marks or punctuation.
+DICT_MAX_WORDS = 4
+DICT_MAX_WORDS_VI = 6
+DICT_MAX_CHARS_ZH = 6
+DICT_MAX_CHARS_JA = 10
+DICT_MAX_CHARS_SEA = 12  # Thai, Lao, Khmer, Burmese
+_SEA_SCRIPT_RE = re.compile(r'[\u0E00-\u0EFF\u1000-\u109F\u1780-\u17FF]')
+# Includes half-width katakana (U+FF66-FF9F).
+_KANA_RE = re.compile(r'[\u3040-\u30FF\u31F0-\u31FF\uFF66-\uFF9F]')
+_HAN_RE = re.compile(r'[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\U00020000-\U000323AF]')
+
+
+def _dict_text_too_long(word, source):
+    # Android voices may say vi_VN as well as vi-VN.
+    src = re.split(r'[-_]', source.casefold())[0]
+    if len(word.split()) > (DICT_MAX_WORDS_VI if src == 'vi' else DICT_MAX_WORDS):
+        return True
+    letters = sum(
+        1 for char in word
+        if not char.isspace() and unicodedata.category(char)[0] not in ('M', 'P', 'S')
+    )
+    if _SEA_SCRIPT_RE.search(word):
+        return letters > DICT_MAX_CHARS_SEA
+    if _KANA_RE.search(word):
+        return letters > DICT_MAX_CHARS_JA
+    if _HAN_RE.search(word):
+        return letters > (DICT_MAX_CHARS_JA if src == 'ja' else DICT_MAX_CHARS_ZH)
+    return False
+
+
 def _dict_request_fields(payload):
     if (not isinstance(payload, dict)
             or set(payload) != DICT_ALLOWED_PAYLOAD_KEYS
@@ -356,7 +390,7 @@ def _dict_request_fields(payload):
     source = _clean_dict_field(payload.get("source"), 64)
     target = _clean_dict_field(payload.get("target"), 64)
     word = _clean_dict_field(payload.get("word"), 160)
-    if not source or not target or not word:
+    if not source or not target or not word or _dict_text_too_long(word, source):
         return None
     return source, target, word, payload["mode"]
 

@@ -64,6 +64,31 @@ class DictFallbackTest(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         post.assert_not_called()
 
+    # Same cases as the phone's test_refinements.js, so the two limits stay in step.
+    def test_length_limit_keeps_phrases_and_refuses_sentences(self):
+        allowed = [
+            ("look forward to it", "en"), ("aujourd'hui", "fr"),
+            ("Donaudampfschifffahrtsgesellschaft", "de"), ("cảm ơn bạn rất nhiều", "vi"),
+            ("电子邮件地址", "zh"), ("一见钟情。", "zh"), ("取り扱う", "ja"),
+            ("東京都庁舎前駅", "ja"), ("โรงพยาบาล", "th"), ("หรือเปล่า", "unknown"),
+            ("cảm ơn bạn rất nhiều", "vi_VN"), ("ｺﾝﾋﾞﾆ", "ja"), ("一𠀀𠀁𠀂", "zh"), ("今天😊去学校", "zh"),
+        ]
+        refused = [
+            ("I really want to go", "en"), ("tôi muốn đi đến trường học hôm nay", "vi"),
+            ("我今天想去学校", "zh"), ("今日は学校に行きたいです", "ja"),
+            ("ฉันอยากไปโรงเรียนวันนี้", "th"), ("ﾜﾀｼﾊｷｮｳｶﾞｯｺｳﾆｲｷﾀｲﾃﾞｽ", "ja"), ("𠀀𠀁𠀂𠀃𠀄𠀅𠀆", "zh"), ("𱍐𱍐𱍐𱍐𱍐𱍐𱍐", "zh"),
+        ]
+        for word, source in allowed:
+            self.assertFalse(api._dict_text_too_long(word, source), word)
+        for word, source in refused:
+            self.assertTrue(api._dict_text_too_long(word, source), word)
+
+    @patch("app.requests.post")
+    def test_rejects_sentence_before_upstream(self, post):
+        response = self.post(payload={**self.payload, "word": "今日は学校に行きたいです"})
+        self.assertEqual(response.status_code, 400)
+        post.assert_not_called()
+
     def test_normalizer_rejects_preamble_and_cleans_per_term_quotes(self):
         self.assertIsNone(api._normalized_dict_text("Sure! Here are: cat, feline"))
         self.assertIsNone(api._normalized_dict_text("Here are cat, feline"))
