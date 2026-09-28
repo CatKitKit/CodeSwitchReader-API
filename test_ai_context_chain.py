@@ -95,7 +95,7 @@ class AiContextChainTest(unittest.TestCase):
         self.assert_contract(response)
         self.assertEqual(post.call_count, 1)
         call = post.call_args
-        self.assertIn("gemini-3.5-flash-lite", call.args[0])
+        self.assertIn("gemini-3.1-flash-lite", call.args[0])
         self.assertNotIn("openrouter.ai", call.args[0])
         self.assertEqual(call.kwargs["headers"], {"x-goog-api-key": "gemini-test"})
         self.assertNotIn("purpose", call.kwargs["json"])
@@ -155,7 +155,7 @@ class AiContextChainTest(unittest.TestCase):
         self.assert_contract(response)
         self.assertEqual(post.call_count, 2)
         gemini = post.call_args_list[1]
-        self.assertIn("gemini-3.5-flash-lite", gemini.args[0])
+        self.assertIn("gemini-3.1-flash-lite", gemini.args[0])
         self.assertNotIn("?key=", gemini.args[0])
         self.assertEqual(gemini.kwargs["headers"], {"x-goog-api-key": "gemini-test"})
         timeout = gemini.kwargs["timeout"]
@@ -333,7 +333,7 @@ class AiContextChainTest(unittest.TestCase):
             response = self.post(unmarked)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(post.call_count, 1)
-        self.assertIn("gemini-3.5-flash-lite", post.call_args.args[0])
+        self.assertIn("gemini-3.1-flash-lite", post.call_args.args[0])
         self.assertNotIn("openrouter.ai", post.call_args.args[0])
 
 

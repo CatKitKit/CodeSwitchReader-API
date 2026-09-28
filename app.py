@@ -55,7 +55,9 @@ MAX_BODY_BYTES = 50 * 1024
 # AI Context explanations alone use the slower, quality-first provider chain. The
 # phone marks only that request; summaries, Studios, lessons, and translations keep
 # the ordinary Gemini-only /ai-proxy path below.
-GEMINI_FLASH_LITE_MODEL = "gemini-3.5-flash-lite"
+# Temporary 3.1 switch: 3.5 returned high-demand 503s / story timeouts on 2026-09-28.
+# Kit will decide whether to add an automatic fallback later.
+GEMINI_FLASH_LITE_MODEL = "gemini-3.1-flash-lite"
 CONTEXT_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 CONTEXT_OPENROUTER_PROVIDER = "venice"
 CONTEXT_OPENROUTER_MODEL = "google/gemma-4-31b-it"

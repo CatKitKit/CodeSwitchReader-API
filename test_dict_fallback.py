@@ -183,7 +183,7 @@ class DictFallbackTest(unittest.TestCase):
 
         self.assertEqual(response.get_json(), {"text": "cat", "found": True})
         self.assertEqual(post.call_count, 3)
-        self.assertIn("gemini-3.5-flash-lite", post.call_args_list[2].args[0])
+        self.assertIn("gemini-3.1-flash-lite", post.call_args_list[2].args[0])
 
     @patch("app.requests.post")
     def test_all_sentinels_return_the_exact_contract(self, post):
@@ -254,7 +254,7 @@ class DictFallbackTest(unittest.TestCase):
         self.assertEqual(response.get_json(), {"text": "cat", "found": True})
         self.assertEqual(post.call_count, 1)
         gemini_call = post.call_args
-        self.assertIn("gemini-3.5-flash-lite", gemini_call.args[0])
+        self.assertIn("gemini-3.1-flash-lite", gemini_call.args[0])
         self.assertNotIn("?key=", gemini_call.args[0])
         self.assertEqual(gemini_call.kwargs["headers"], {"x-goog-api-key": "gemini-test"})
         generation = gemini_call.kwargs["json"]["generationConfig"]
