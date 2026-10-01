@@ -63,6 +63,8 @@ CONTEXT_OPENROUTER_PROVIDER = "venice"
 CONTEXT_OPENROUTER_MODEL = "google/gemma-4-31b-it"
 CONTEXT_GEMINI_MODEL = GEMINI_FLASH_LITE_MODEL
 CONTEXT_PROVIDER_TIMEOUT_SECS = 18
+# The phone asks for three; the margin tolerates a model that adds one.
+CONTEXT_MAX_EXAMPLES = 5
 # Ordinary development can avoid OpenRouter charges entirely. Set this Cloud Run
 # variable to "venice" for the benchmarked Venice -> Gemini launch chain.
 AI_CONTEXT_MODE_ENV = "AI_CONTEXT_MODE"
@@ -608,7 +610,7 @@ def _context_contract_json(raw_text):
     if parsed is None:
         return None
 
-    required = ("translation", "explainHtml", "examplesHtml")
+    required = ("translation", "explainHtml")
     if any(not isinstance(parsed.get(field), str) or not parsed[field].strip()
            for field in required):
         return None
@@ -618,7 +620,40 @@ def _context_contract_json(raw_text):
            for field in required):
         return None
     clean = {field: parsed[field].strip() for field in required}
+
+    # The phone plays and saves each example, so it asks for them as separate plain-text
+    # pairs. examplesHtml is the older phone build's shape; it stays valid so a deploy
+    # never breaks an installed phone. A same-language answer has no translations.
+    examples = _context_examples(parsed.get("examples"))
+    if examples:
+        clean["examples"] = examples
+    else:
+        legacy = parsed.get("examplesHtml")
+        if (not isinstance(legacy, str)
+                or not html.unescape(re.sub(r"<[^>]*>", "", legacy)).strip()):
+            return None
+        clean["examplesHtml"] = legacy.strip()
     return json.dumps(clean, ensure_ascii=False, separators=(",", ":"))
+
+
+def _context_example_text(value):
+    if not isinstance(value, str):
+        return None
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]*>", "", value))).strip()
+
+
+def _context_examples(value):
+    if not isinstance(value, list):
+        return []
+    examples = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        sentence = _context_example_text(item.get("sentence"))
+        translation = _context_example_text(item.get("translation", ""))
+        if sentence and translation is not None:
+            examples.append({"sentence": sentence, "translation": translation})
+    return examples[:CONTEXT_MAX_EXAMPLES]
 
 
 def _context_envelope(contract_json):

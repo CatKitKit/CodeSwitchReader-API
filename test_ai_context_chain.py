@@ -207,6 +207,36 @@ class AiContextChainTest(unittest.TestCase):
                 self.assert_contract(response)
                 self.assertEqual(post.call_count, 2)
 
+    def test_example_pairs_are_cleaned_and_replace_the_html_list(self):
+        raw = json.dumps({
+            "translation": "left",
+            "explainHtml": "<p>x</p>",
+            "examples": [
+                {"sentence": "<strong>Evden</strong>  çıktım.", "translation": "I left home &amp; ran."},
+                {"sentence": "Gato.", "translation": ""},
+                {"sentence": "  ", "translation": "dropped: no sentence"},
+                {"sentence": "Dropped.", "translation": 3},
+                "not an object",
+            ] + [{"sentence": f"S{n}.", "translation": f"T{n}."} for n in range(6)],
+            "examplesHtml": "<ol><li>ignored</li></ol>",
+        }, ensure_ascii=False)
+        clean = json.loads(api._context_contract_json(raw))
+        self.assertNotIn("examplesHtml", clean)
+        self.assertEqual(clean["examples"][0], {"sentence": "Evden çıktım.", "translation": "I left home & ran."})
+        self.assertEqual(clean["examples"][1], {"sentence": "Gato.", "translation": ""})
+        self.assertEqual(len(clean["examples"]), api.CONTEXT_MAX_EXAMPLES)
+
+    def test_older_phone_html_examples_still_pass(self):
+        clean = json.loads(api._context_contract_json(VALID_JSON))
+        self.assertEqual(clean["examplesHtml"], VALID_OBJECT["examplesHtml"])
+        self.assertNotIn("examples", clean)
+
+    def test_no_usable_example_in_either_shape_is_rejected(self):
+        for examples in ([], [{"sentence": "", "translation": "x"}], "not a list"):
+            with self.subTest(examples=examples):
+                raw = json.dumps({"translation": "x", "explainHtml": "<p>x</p>", "examples": examples})
+                self.assertIsNone(api._context_contract_json(raw))
+
     @patch("app.requests.post")
     def test_invalid_provider_json_and_truncation_fall_through(self, post):
         first_responses = (
