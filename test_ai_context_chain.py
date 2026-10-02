@@ -9,7 +9,7 @@ import app as api
 VALID_OBJECT = {
     "translation": "got off the bus",
     "explainHtml": "<p><strong>otobüsten</strong> uses the ablative.</p>",
-    "examplesHtml": "<ol><li><strong>Evden çıktım.</strong> I left home.</li></ol>",
+    "examples": [{"sentence": "Evden çıktım.", "translation": "I left home."}],
 }
 VALID_JSON = json.dumps(VALID_OBJECT, ensure_ascii=False)
 
@@ -190,10 +190,12 @@ class AiContextChainTest(unittest.TestCase):
         bad_outputs = (
             "not json",
             '{"translation":"x","explainHtml":"<p>x</p>"}',
-            '{"translation":" ","explainHtml":"<p>x</p>","examplesHtml":"<ol>x</ol>"}',
-            '{"translation":3,"explainHtml":"<p>x</p>","examplesHtml":"<ol>x</ol>"}',
-            '{"translation":"x","explainHtml":"<p></p>","examplesHtml":"<ol></ol>"}',
-            '{"translation":"x","explainHtml":"<p>&nbsp;</p>","examplesHtml":"<ol>&nbsp;</ol>"}',
+            '{"translation":" ","explainHtml":"<p>x</p>","examples":[{"sentence":"S.","translation":"T."}]}',
+            '{"translation":3,"explainHtml":"<p>x</p>","examples":[{"sentence":"S.","translation":"T."}]}',
+            '{"translation":"x","explainHtml":"<p></p>","examples":[{"sentence":"S.","translation":"T."}]}',
+            '{"translation":"x","explainHtml":"<p>&nbsp;</p>","examples":[{"sentence":"S.","translation":"T."}]}',
+            # The pre-10/1 phone shape is gone: a provider answering in it falls through.
+            '{"translation":"x","explainHtml":"<p>x</p>","examplesHtml":"<ol><li>S.</li></ol>"}',
         )
         for raw in bad_outputs:
             with self.subTest(raw=raw):
@@ -226,12 +228,7 @@ class AiContextChainTest(unittest.TestCase):
         self.assertEqual(clean["examples"][1], {"sentence": "Gato.", "translation": ""})
         self.assertEqual(len(clean["examples"]), api.CONTEXT_MAX_EXAMPLES)
 
-    def test_older_phone_html_examples_still_pass(self):
-        clean = json.loads(api._context_contract_json(VALID_JSON))
-        self.assertEqual(clean["examplesHtml"], VALID_OBJECT["examplesHtml"])
-        self.assertNotIn("examples", clean)
-
-    def test_no_usable_example_in_either_shape_is_rejected(self):
+    def test_no_usable_example_is_rejected(self):
         for examples in ([], [{"sentence": "", "translation": "x"}], "not a list"):
             with self.subTest(examples=examples):
                 raw = json.dumps({"translation": "x", "explainHtml": "<p>x</p>", "examples": examples})

@@ -622,17 +622,11 @@ def _context_contract_json(raw_text):
     clean = {field: parsed[field].strip() for field in required}
 
     # The phone plays and saves each example, so it asks for them as separate plain-text
-    # pairs. examplesHtml is the older phone build's shape; it stays valid so a deploy
-    # never breaks an installed phone. A same-language answer has no translations.
+    # pairs. A same-language answer has no translations.
     examples = _context_examples(parsed.get("examples"))
-    if examples:
-        clean["examples"] = examples
-    else:
-        legacy = parsed.get("examplesHtml")
-        if (not isinstance(legacy, str)
-                or not html.unescape(re.sub(r"<[^>]*>", "", legacy)).strip()):
-            return None
-        clean["examplesHtml"] = legacy.strip()
+    if not examples:
+        return None
+    clean["examples"] = examples
     return json.dumps(clean, ensure_ascii=False, separators=(",", ":"))
 
 
