@@ -109,7 +109,7 @@ _report_global_hits = []
 SONG_GENERATION_ENABLED = os.environ.get(
     "SONG_GENERATION_ENABLED", ""
 ).strip().lower() in {"1", "true", "yes", "on"}
-SONG_MODEL = "lyria-3-pro-preview"
+SONG_MODEL = "lyria-3.5"
 SONG_INTERACTIONS_URL = (
     "https://generativelanguage.googleapis.com/v1beta/interactions"
 )

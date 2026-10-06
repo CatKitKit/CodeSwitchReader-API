@@ -136,10 +136,10 @@ class SongBakeTest(unittest.TestCase):
         self.assertEqual(base64.b64decode(body["audioBase64"]), self.audio)
         self.assertEqual(body["mimeType"], "audio/mpeg")
         self.assertEqual(body["bytes"], len(self.audio))
-        self.assertEqual(body["model"], "lyria-3-pro-preview")
+        self.assertEqual(body["model"], "lyria-3.5")
         args, kwargs = send.call_args
         self.assertEqual(args[0], api.SONG_INTERACTIONS_URL)
-        self.assertEqual(kwargs["json"]["model"], "lyria-3-pro-preview")
+        self.assertEqual(kwargs["json"]["model"], "lyria-3.5")
         prompt = kwargs["json"]["input"]
         self.assertIn(self.payload["lyrics"], prompt)
         self.assertIn("Spanish", prompt)
