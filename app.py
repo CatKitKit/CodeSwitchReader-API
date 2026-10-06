@@ -114,6 +114,9 @@ SONG_INTERACTIONS_URL = (
     "https://generativelanguage.googleapis.com/v1beta/interactions"
 )
 SONG_ALLOWED_PAYLOAD_KEYS = {"lyrics", "targetLanguage", "style", "mood"}
+# Optional, so a phone that predates the choice still bakes (Lyria then picks the singer).
+SONG_OPTIONAL_PAYLOAD_KEYS = {"voice"}
+SONG_VOICES = {"female": "a female lead singer", "male": "a male lead singer"}
 SONG_LANGUAGES = frozenset({
     "English", "French", "German", "Hindi",
     "Japanese", "Korean", "Portuguese", "Spanish",
@@ -127,7 +130,7 @@ SONG_MOODS = {
 SONG_MAX_BODY_BYTES = 48 * 1024
 SONG_MAX_AUDIO_BYTES = 12 * 1024 * 1024
 SONG_RATE_WINDOW_SECS = 10 * 60
-SONG_RATE_MAX_PER_WINDOW = int(os.environ.get("SONG_RATE_MAX_PER_WINDOW", "2"))
+SONG_RATE_MAX_PER_WINDOW = int(os.environ.get("SONG_RATE_MAX_PER_WINDOW", "3"))  # all 3 free songs back to back
 SONG_DAILY_MAX = int(os.environ.get("SONG_DAILY_MAX", "25"))
 _song_rate_lock = threading.Lock()
 _song_ip_hits = {}
@@ -230,7 +233,7 @@ def _song_rate_limited():
         ]
         if len(hits) >= SONG_RATE_MAX_PER_WINDOW:
             _song_ip_hits[ip] = hits
-            return jsonify({"error": "Please wait before baking another song."}), 429
+            return jsonify({"error": "Too many songs in a few minutes. Please try again in about 10 minutes."}), 429
         hits.append(now)
         _song_ip_hits[ip] = hits
         _song_daily["count"] += 1
@@ -281,9 +284,14 @@ def _report_request_fields(payload):
 
 def _song_request_fields(payload):
     if (not isinstance(payload, dict)
-            or set(payload) != SONG_ALLOWED_PAYLOAD_KEYS
-            or payload.get("style") not in SONG_STYLES
-            or payload.get("mood") not in SONG_MOODS):
+            or not SONG_ALLOWED_PAYLOAD_KEYS <= set(payload)
+            or not set(payload) <= SONG_ALLOWED_PAYLOAD_KEYS | SONG_OPTIONAL_PAYLOAD_KEYS
+            # A list or dict would make set/dict membership raise, not refuse.
+            or not all(isinstance(payload.get(key), str) for key in ("style", "mood"))
+            or payload["style"] not in SONG_STYLES
+            or payload["mood"] not in SONG_MOODS
+            or ("voice" in payload and not (
+                isinstance(payload["voice"], str) and payload["voice"] in SONG_VOICES))):
         return None
     lyrics = _clean_report_field(payload.get("lyrics"), 12000, required=True)
     target_language = _clean_report_field(
@@ -296,6 +304,7 @@ def _song_request_fields(payload):
         "targetLanguage": target_language,
         "style": payload["style"],
         "mood": payload["mood"],
+        "voice": payload.get("voice", ""),
     }
 
 
@@ -303,10 +312,13 @@ def _song_prompt(fields):
     # A per-request marker keeps user-editable lyrics from forging the end delimiter
     # and moving their text into the instruction portion of the prompt.
     lyric_marker = secrets.token_hex(12)
+    singer = SONG_VOICES.get(fields.get("voice", ""))
+    vocals = f"Sung by {singer}, with warm, clearly articulated vocals." if singer \
+        else "Use warm, clearly articulated vocals."
     return (
         f"Create an approximately 90-second {fields['mood']} {fields['style']} song "
-        f"for a learner of {fields['targetLanguage']}. Use warm, clearly articulated "
-        "vocals. Sing exactly the supplied lyrics: do not add, remove, translate, "
+        f"for a learner of {fields['targetLanguage']}. {vocals} "
+        "Sing exactly the supplied lyrics: do not add, remove, translate, "
         "repeat beyond the written repeats, or rewrite any lyric line. Treat the "
         "square-bracketed section markers as structure, not words to sing. Do not "
         "name or imitate a real artist.\n\n"
