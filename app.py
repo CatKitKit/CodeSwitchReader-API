@@ -55,9 +55,12 @@ MAX_BODY_BYTES = 50 * 1024
 # AI Context explanations alone use the slower, quality-first provider chain. The
 # phone marks only that request; summaries, Studios, lessons, and translations keep
 # the ordinary Gemini-only /ai-proxy path below.
-# Temporary 3.1 switch: 3.5 returned high-demand 503s / story timeouts on 2026-09-28.
-# Kit will decide whether to add an automatic fallback later.
-GEMINI_FLASH_LITE_MODEL = "gemini-3.1-flash-lite"
+# Ordinary /ai-proxy calls fall to 3.1 on busy/down errors: 3.5 overloaded on the
+# free tier on 2026-09-28. Dictionary and context already have OpenRouter in front
+# of Gemini, so they get no second Gemini model (Kit, 2026-10-07).
+GEMINI_FLASH_LITE_MODEL = "gemini-3.5-flash-lite"
+AI_PROXY_MODELS = (GEMINI_FLASH_LITE_MODEL, "gemini-3.1-flash-lite")
+AI_PROXY_RETRY_STATUSES = {404, 429, 500, 502, 503, 504}
 CONTEXT_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 CONTEXT_OPENROUTER_PROVIDER = "venice"
 CONTEXT_OPENROUTER_MODEL = "google/gemma-4-31b-it"
@@ -920,28 +923,39 @@ def ai_proxy():
     if not api_key:
         return jsonify({"error": "Server not configured"}), 503
 
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_FLASH_LITE_MODEL}:generateContent"
-    )
-    try:
-        response = requests.post(
-            url,
-            headers={"x-goog-api-key": api_key},
-            json=payload,
-            timeout=30,
+    for i, model in enumerate(AI_PROXY_MODELS):
+        is_last = i == len(AI_PROXY_MODELS) - 1
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model}:generateContent"
         )
-        # Pass Gemini's JSON through with a 200 like before — mobile.js checks
-        # data.candidates and has its own error UX; don't change the contract.
-        return jsonify(response.json())
-    except requests.Timeout:
-        return jsonify({"error": "Upstream timeout"}), 502
-    except requests.RequestException:
-        app.logger.warning("ai-proxy upstream request failed")
-        return jsonify({"error": "Upstream error"}), 502
-    except Exception:
-        app.logger.exception("ai-proxy upstream failure")
-        return jsonify({"error": "Upstream error"}), 502
+        try:
+            response = requests.post(
+                url,
+                headers={"x-goog-api-key": api_key},
+                json=payload,
+                timeout=30,
+            )
+            # 404 too: a retired model id should not take every Studio down with it.
+            if not is_last and response.status_code in AI_PROXY_RETRY_STATUSES:
+                app.logger.warning(
+                    "ai-proxy model=%s status=%s; trying next", model, response.status_code
+                )
+                continue
+            # Pass Gemini's JSON through with a 200 like before — mobile.js checks
+            # data.candidates and has its own error UX; don't change the contract.
+            return jsonify(response.json())
+        except requests.Timeout:
+            app.logger.warning("ai-proxy model=%s timeout", model)
+            if is_last:
+                return jsonify({"error": "Upstream timeout"}), 502
+        except requests.RequestException:
+            app.logger.warning("ai-proxy model=%s request failed", model)
+            if is_last:
+                return jsonify({"error": "Upstream error"}), 502
+        except Exception:
+            app.logger.exception("ai-proxy model=%s failure", model)
+            return jsonify({"error": "Upstream error"}), 502
 
 
 @app.route('/song-bake', methods=['POST'])

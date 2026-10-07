@@ -95,7 +95,7 @@ class AiContextChainTest(unittest.TestCase):
         self.assert_contract(response)
         self.assertEqual(post.call_count, 1)
         call = post.call_args
-        self.assertIn("gemini-3.1-flash-lite", call.args[0])
+        self.assertIn("gemini-3.5-flash-lite", call.args[0])
         self.assertNotIn("openrouter.ai", call.args[0])
         self.assertEqual(call.kwargs["headers"], {"x-goog-api-key": "gemini-test"})
         self.assertNotIn("purpose", call.kwargs["json"])
@@ -155,7 +155,7 @@ class AiContextChainTest(unittest.TestCase):
         self.assert_contract(response)
         self.assertEqual(post.call_count, 2)
         gemini = post.call_args_list[1]
-        self.assertIn("gemini-3.1-flash-lite", gemini.args[0])
+        self.assertIn("gemini-3.5-flash-lite", gemini.args[0])
         self.assertNotIn("?key=", gemini.args[0])
         self.assertEqual(gemini.kwargs["headers"], {"x-goog-api-key": "gemini-test"})
         timeout = gemini.kwargs["timeout"]
@@ -360,8 +360,43 @@ class AiContextChainTest(unittest.TestCase):
             response = self.post(unmarked)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(post.call_count, 1)
-        self.assertIn("gemini-3.1-flash-lite", post.call_args.args[0])
+        self.assertIn("gemini-3.5-flash-lite", post.call_args.args[0])
         self.assertNotIn("openrouter.ai", post.call_args.args[0])
+
+    UNMARKED = {"contents": [{"parts": [{"text": "ordinary Studio prompt"}]}]}
+
+    def post_unmarked(self):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "gemini-test"}):
+            return self.post(self.UNMARKED)
+
+    @patch.object(api.requests, "post")
+    def test_unmarked_busy_or_down_35_falls_to_31(self, post):
+        for failure in (FakeResponse(503, {"error": {}}), FakeResponse(429, {}),
+                        FakeResponse(404, {}), api.requests.Timeout("synthetic"),
+                        api.requests.ConnectionError("synthetic")):
+            post.reset_mock()
+            post.side_effect = [failure, FakeResponse(200, {"candidates": ["ok"]})]
+            response = self.post_unmarked()
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.get_json(), {"candidates": ["ok"]})
+            self.assertEqual(post.call_count, 2)
+            self.assertIn("gemini-3.5-flash-lite", post.call_args_list[0].args[0])
+            self.assertIn("gemini-3.1-flash-lite", post.call_args_list[1].args[0])
+
+    @patch.object(api.requests, "post")
+    def test_unmarked_client_error_is_not_retried(self, post):
+        post.return_value = FakeResponse(400, {"error": {"code": 400}})
+        response = self.post_unmarked()
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(response.get_json(), {"error": {"code": 400}})
+
+    @patch.object(api.requests, "post")
+    def test_unmarked_both_models_failing_keeps_old_behaviour(self, post):
+        post.side_effect = [FakeResponse(503, {}), FakeResponse(503, {"error": {"code": 503}})]
+        response = self.post_unmarked()
+        self.assertEqual(response.get_json(), {"error": {"code": 503}})
+        post.side_effect = [api.requests.Timeout("a"), api.requests.Timeout("b")]
+        self.assertEqual(self.post_unmarked().status_code, 502)
 
 
 if __name__ == "__main__":
