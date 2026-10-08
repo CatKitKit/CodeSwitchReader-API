@@ -51,7 +51,7 @@ class AiContextChainTest(unittest.TestCase):
     def setUp(self):
         self.old_app_key = api.APP_KEY
         self.old_context_mode = os.environ.get(api.AI_CONTEXT_MODE_ENV)
-        os.environ[api.AI_CONTEXT_MODE_ENV] = "venice"
+        os.environ[api.AI_CONTEXT_MODE_ENV] = "openrouter"
         api.APP_KEY = "test-app-key"
         with api._rate_lock:
             api._ip_hits.clear()
@@ -113,7 +113,7 @@ class AiContextChainTest(unittest.TestCase):
         post.assert_not_called()
 
     @patch("app.requests.post")
-    def test_venice_success_is_strictly_pinned_private_and_gemini_shaped(self, post):
+    def test_openrouter_success_is_strictly_pinned_private_and_gemini_shaped(self, post):
         post.return_value = openrouter_response(
             VALID_JSON, reasoning="This must never reach the client"
         )
@@ -136,8 +136,8 @@ class AiContextChainTest(unittest.TestCase):
         self.assertEqual(body["messages"], [{"role": "user", "content": self.prompt}])
         self.assertEqual(body["response_format"], {"type": "json_object"})
         self.assertEqual(body["provider"], {
-            "only": ["venice"],
-            "order": ["venice"],
+            "only": ["coreweave"],
+            "order": ["coreweave"],
             "allow_fallbacks": False,
             "zdr": True,
             "data_collection": "deny",
@@ -186,7 +186,7 @@ class AiContextChainTest(unittest.TestCase):
                 self.assertEqual(post.call_count, 2)
 
     @patch("app.requests.post")
-    def test_unusable_venice_json_shapes_each_fall_through(self, post):
+    def test_unusable_openrouter_json_shapes_each_fall_through(self, post):
         bad_outputs = (
             "not json",
             '{"translation":"x","explainHtml":"<p>x</p>"}',
@@ -284,7 +284,7 @@ class AiContextChainTest(unittest.TestCase):
     @patch("app.requests.post")
     def test_missing_primary_configuration_does_not_silently_skip_to_gemini(self, post):
         with patch.dict(os.environ, {
-            "AI_CONTEXT_MODE": "venice",
+            "AI_CONTEXT_MODE": "openrouter",
             "GEMINI_API_KEY": "gemini-test",
         }, clear=True):
             response = self.post()

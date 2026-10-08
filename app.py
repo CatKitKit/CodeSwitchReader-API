@@ -62,16 +62,18 @@ GEMINI_FLASH_LITE_MODEL = "gemini-3.5-flash-lite"
 AI_PROXY_MODELS = (GEMINI_FLASH_LITE_MODEL, "gemini-3.1-flash-lite")
 AI_PROXY_RETRY_STATUSES = {404, 429, 500, 502, 503, 504}
 CONTEXT_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-CONTEXT_OPENROUTER_PROVIDER = "venice"
+# CoreWeave over Venice (Kit, 2026-10-07): similar answers, no 18 s+ tail, and its
+# "busy" 429s come back in about a second, so Gemini still answers fast.
+CONTEXT_OPENROUTER_PROVIDER = "coreweave"
 CONTEXT_OPENROUTER_MODEL = "google/gemma-4-31b-it"
 CONTEXT_GEMINI_MODEL = GEMINI_FLASH_LITE_MODEL
 CONTEXT_PROVIDER_TIMEOUT_SECS = 18
 # The phone asks for three; the margin tolerates a model that adds one.
 CONTEXT_MAX_EXAMPLES = 5
 # Ordinary development can avoid OpenRouter charges entirely. Set this Cloud Run
-# variable to "venice" for the benchmarked Venice -> Gemini launch chain.
+# variable to "openrouter" for the CoreWeave -> Gemini launch chain.
 AI_CONTEXT_MODE_ENV = "AI_CONTEXT_MODE"
-AI_CONTEXT_MODES = {"gemini", "venice"}
+AI_CONTEXT_MODES = {"gemini", "openrouter"}
 AI_CONTEXT_DEFAULT_MODE = "gemini"
 
 # The popup dictionary gets a separate, deliberately tiny contract. The phone sends
@@ -784,7 +786,7 @@ def _serve_gemini_context(api_key, payload):
 def _ai_context_explanation(payload):
     # The phone owns cancellation/stale UI with AbortController + request ids. This
     # synchronous Flask handler cannot reliably observe that the client disconnected,
-    # so an already-running Venice request may still proceed to Gemini and incur cost;
+    # so an already-running OpenRouter request may still proceed to Gemini and incur cost;
     # preventing that would require a queued/asynchronous backend architecture.
     gemini_payload = _context_request_payload(payload)
     if gemini_payload is None:
@@ -816,11 +818,11 @@ def _ai_context_explanation(payload):
             if contract:
                 return jsonify(_context_envelope(contract))
             should_fallback = True
-            app.logger.warning("ai-context provider=venice unusable response")
+            app.logger.warning("ai-context provider=%s unusable response", CONTEXT_OPENROUTER_PROVIDER)
         elif response.status_code == 429 or response.status_code >= 500:
             should_fallback = True
             app.logger.warning(
-                "ai-context provider=venice status=%s", response.status_code
+                "ai-context provider=%s status=%s", CONTEXT_OPENROUTER_PROVIDER, response.status_code
             )
         else:
             # 400/401/403 and every other client/configuration response surface now.
@@ -828,12 +830,12 @@ def _ai_context_explanation(payload):
             return jsonify({"error": "AI context provider rejected request"}), status
     except requests.Timeout:
         should_fallback = True
-        app.logger.warning("ai-context provider=venice timeout")
+        app.logger.warning("ai-context provider=%s timeout", CONTEXT_OPENROUTER_PROVIDER)
     except requests.RequestException:
-        app.logger.warning("ai-context provider=venice request failed")
+        app.logger.warning("ai-context provider=%s request failed", CONTEXT_OPENROUTER_PROVIDER)
         return jsonify({"error": "Upstream error"}), 502
     except Exception:
-        app.logger.exception("ai-context provider=venice failure")
+        app.logger.exception("ai-context provider=%s failure", CONTEXT_OPENROUTER_PROVIDER)
         return jsonify({"error": "Upstream error"}), 502
 
     if not should_fallback:
