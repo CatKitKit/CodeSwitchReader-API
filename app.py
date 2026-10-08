@@ -60,7 +60,17 @@ MAX_BODY_BYTES = 50 * 1024
 # of Gemini, so they get no second Gemini model (Kit, 2026-10-07).
 GEMINI_FLASH_LITE_MODEL = "gemini-3.5-flash-lite"
 AI_PROXY_MODELS = (GEMINI_FLASH_LITE_MODEL, "gemini-3.1-flash-lite")
-AI_PROXY_RETRY_STATUSES = {404, 429, 500, 502, 503, 504}
+# When every Gemini model fails, Gemma 4 31B on ModelRun answers instead: as fast as
+# Flash-Lite with comparable language quality (bench 2026-10-07). Translations go to it
+# FIRST: Gemma translated idioms better and costs less (Kit, 2026-10-07).
+BACKUP_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+BACKUP_OPENROUTER_PROVIDER = "modelrun"
+BACKUP_OPENROUTER_MODEL = "google/gemma-4-31b-it"
+BACKUP_MAX_TOKENS = 8192
+TRANSLATION_PURPOSE = "translation"
+TRANSLATION_ALLOWED_KEYS = {"contents", "systemInstruction", "purpose"}
+# Gemini's own block shape: the phone already treats "no candidates" as a failed answer.
+BACKUP_BLOCKED = {"promptFeedback": {"blockReason": "OTHER"}}
 CONTEXT_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 # CoreWeave over Venice (Kit, 2026-10-07): similar answers, no 18 s+ tail, and its
 # "busy" 429s come back in about a second, so Gemini still answers fast.
@@ -843,6 +853,169 @@ def _ai_context_explanation(payload):
     return _serve_gemini_context(gemini_key, gemini_payload)
 
 
+def _gemini_retryable(status):
+    return status in (404, 429) or status >= 500
+
+
+def _gemini_chain(api_key, payload):
+    """Gemini 3.5 then 3.1. A response is final; None means every model was busy/down."""
+    for model in AI_PROXY_MODELS:
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model}:generateContent"
+        )
+        try:
+            response = requests.post(
+                url,
+                headers={"x-goog-api-key": api_key},
+                json=payload,
+                timeout=30,
+            )
+        except requests.Timeout:
+            app.logger.warning("ai-proxy model=%s timeout", model)
+            continue
+        except requests.RequestException:
+            app.logger.warning("ai-proxy model=%s request failed", model)
+            continue
+        # 404 too: a retired model id should not take every Studio down with it.
+        if _gemini_retryable(response.status_code):
+            app.logger.warning("ai-proxy model=%s status=%s; trying next", model, response.status_code)
+            continue
+        # Pass Gemini's JSON through with a 200 like before — mobile.js checks
+        # data.candidates and has its own error UX. A safety block passes through too:
+        # never route around it to another model.
+        try:
+            return jsonify(response.json())
+        except ValueError:
+            app.logger.warning("ai-proxy model=%s non-JSON body", model)
+            return jsonify({"error": "Upstream error"}), 502
+    return None
+
+
+def _parts_ok(content):
+    parts = content.get("parts") if isinstance(content, dict) else None
+    return (isinstance(parts, list) and bool(parts)
+            and all(isinstance(p, dict) and isinstance(p.get("text"), str) for p in parts))
+
+
+def _valid_text_payload(payload):
+    """Text-only Gemini shape, checked before a route sends it anywhere but Gemini."""
+    contents = payload.get("contents")
+    if not isinstance(contents, list) or not contents or not all(_parts_ok(c) for c in contents):
+        return False
+    return "systemInstruction" not in payload or _parts_ok(payload["systemInstruction"])
+
+
+def _payload_text(content):
+    parts = content.get("parts") if isinstance(content, dict) else None
+    if not isinstance(parts, list):
+        return ""
+    return "".join(p.get("text", "") for p in parts if isinstance(p, dict) and isinstance(p.get("text"), str))
+
+
+def _is_openrouter_block(error):
+    # OpenRouter can report moderation inside an HTTP 200 body, at top level or per choice.
+    if not isinstance(error, dict):
+        return False
+    meta = error.get("metadata") if isinstance(error.get("metadata"), dict) else {}
+    kind = str(meta.get("error_type", "")).lower()
+    return error.get("code") == 403 or "content_policy" in kind or "moderation" in kind
+
+
+def _openrouter_backup(api_key, payload):
+    """The phone's Gemini-shaped request answered by Gemma: a Gemini-shaped dict, BACKUP_BLOCKED
+    when the provider refused the content (final: never retry it elsewhere), or None."""
+    if not api_key:
+        return None
+    messages = []
+    system = _payload_text(payload.get("systemInstruction"))
+    if system.strip():
+        messages.append({"role": "system", "content": system})
+    for content in payload.get("contents") or []:
+        text = _payload_text(content)
+        if text.strip():
+            role = "assistant" if isinstance(content, dict) and content.get("role") == "model" else "user"
+            messages.append({"role": role, "content": text})
+    if not any(m["role"] == "user" for m in messages):
+        return None
+    generation = payload.get("generationConfig")
+    wants_json = isinstance(generation, dict) and generation.get("responseMimeType") == "application/json"
+    body = {
+        "model": BACKUP_OPENROUTER_MODEL,
+        "messages": messages,
+        "max_tokens": BACKUP_MAX_TOKENS,
+        "stream": False,
+        # No response_format even for JSON requests: ModelRun returns hollow `{}` in JSON
+        # mode (bench 2026-07-12). The lesson prompt already demands JSON, and the phone's
+        # parser strips fences.
+        "provider": {
+            "only": [BACKUP_OPENROUTER_PROVIDER],
+            "order": [BACKUP_OPENROUTER_PROVIDER],
+            "allow_fallbacks": False,
+            "zdr": True,
+            "data_collection": "deny",
+        },
+    }
+    try:
+        response = requests.post(
+            BACKUP_OPENROUTER_URL,
+            headers={"Authorization": f"Bearer {api_key}"},
+            json=body,
+            timeout=(3.05, 45),
+        )
+        if response.status_code != 200:
+            app.logger.warning("ai-proxy backup=%s status=%s", BACKUP_OPENROUTER_PROVIDER, response.status_code)
+            # OpenRouter's 403 = moderation flagged the input.
+            return BACKUP_BLOCKED if response.status_code == 403 else None
+        data = response.json()
+    except requests.Timeout:
+        app.logger.warning("ai-proxy backup=%s timeout", BACKUP_OPENROUTER_PROVIDER)
+        return None
+    except (requests.RequestException, ValueError):
+        app.logger.warning("ai-proxy backup=%s request failed", BACKUP_OPENROUTER_PROVIDER)
+        return None
+    if isinstance(data, dict) and _is_openrouter_block(data.get("error")):
+        return BACKUP_BLOCKED
+    choices = data.get("choices") if isinstance(data, dict) else None
+    choice = choices[0] if isinstance(choices, list) and choices else None
+    if isinstance(choice, dict) and (choice.get("finish_reason") == "content_filter"
+                                     or _is_openrouter_block(choice.get("error"))):
+        return BACKUP_BLOCKED
+    # A cut-off story or translation is worse than an honest failure.
+    if not isinstance(choice, dict) or choice.get("finish_reason") != "stop":
+        return None
+    message = choice.get("message")
+    text = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(text, str) or not text.strip():
+        return None
+    if wants_json and ("{" not in text or "}" not in text):
+        return None
+    return {
+        "candidates": [{
+            "content": {"role": "model", "parts": [{"text": text}]},
+            "finishReason": "STOP",
+        }],
+        "modelVersion": f"{BACKUP_OPENROUTER_MODEL} ({BACKUP_OPENROUTER_PROVIDER})",
+    }
+
+
+def _ai_translation(payload):
+    if not set(payload).issubset(TRANSLATION_ALLOWED_KEYS) or not _valid_text_payload(payload):
+        return jsonify({"error": "Bad request"}), 400
+    plain = {key: value for key, value in payload.items() if key != "purpose"}
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    if not openrouter_key and not gemini_key:
+        return jsonify({"error": "Server not configured"}), 503
+    backup = _openrouter_backup(openrouter_key, plain)
+    if backup:
+        return jsonify(backup)
+    if not gemini_key:
+        return jsonify({"error": "Upstream error"}), 502
+    answer = _gemini_chain(gemini_key, plain)
+    return answer if answer is not None else (jsonify({"error": "Upstream error"}), 502)
+
+
 # Initialize the IPA generator for Russian and Arabic
 # We do this globally so it only loads into memory once when the server starts
 print("Loading IPA dictionaries...")
@@ -918,46 +1091,25 @@ def ai_proxy():
             or not set(payload).issubset(ALLOWED_PAYLOAD_KEYS)):
         return jsonify({"error": "Bad request"}), 400
 
-    if "purpose" in payload:
+    if "purpose" in payload and payload.get("purpose") != TRANSLATION_PURPOSE:
         return _ai_context_explanation(payload)
 
-    api_key = os.environ.get('GEMINI_API_KEY')
-    if not api_key:
-        return jsonify({"error": "Server not configured"}), 503
-
-    for i, model in enumerate(AI_PROXY_MODELS):
-        is_last = i == len(AI_PROXY_MODELS) - 1
-        url = (
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{model}:generateContent"
-        )
-        try:
-            response = requests.post(
-                url,
-                headers={"x-goog-api-key": api_key},
-                json=payload,
-                timeout=30,
-            )
-            # 404 too: a retired model id should not take every Studio down with it.
-            if not is_last and response.status_code in AI_PROXY_RETRY_STATUSES:
-                app.logger.warning(
-                    "ai-proxy model=%s status=%s; trying next", model, response.status_code
-                )
-                continue
-            # Pass Gemini's JSON through with a 200 like before — mobile.js checks
-            # data.candidates and has its own error UX; don't change the contract.
-            return jsonify(response.json())
-        except requests.Timeout:
-            app.logger.warning("ai-proxy model=%s timeout", model)
-            if is_last:
-                return jsonify({"error": "Upstream timeout"}), 502
-        except requests.RequestException:
-            app.logger.warning("ai-proxy model=%s request failed", model)
-            if is_last:
-                return jsonify({"error": "Upstream error"}), 502
-        except Exception:
-            app.logger.exception("ai-proxy model=%s failure", model)
-            return jsonify({"error": "Upstream error"}), 502
+    try:
+        if payload.get("purpose") == TRANSLATION_PURPOSE:
+            return _ai_translation(payload)
+        api_key = os.environ.get('GEMINI_API_KEY')
+        if not api_key:
+            return jsonify({"error": "Server not configured"}), 503
+        answer = _gemini_chain(api_key, payload)
+        if answer is not None:
+            return answer
+        backup = _openrouter_backup(os.environ.get("OPENROUTER_API_KEY", ""), payload)
+        if backup:
+            return jsonify(backup)
+        return jsonify({"error": "Upstream error"}), 502
+    except Exception:
+        app.logger.exception("ai-proxy failure")
+        return jsonify({"error": "Upstream error"}), 502
 
 
 @app.route('/song-bake', methods=['POST'])

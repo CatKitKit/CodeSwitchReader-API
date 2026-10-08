@@ -391,12 +391,15 @@ class AiContextChainTest(unittest.TestCase):
         self.assertEqual(response.get_json(), {"error": {"code": 400}})
 
     @patch.object(api.requests, "post")
-    def test_unmarked_both_models_failing_keeps_old_behaviour(self, post):
-        post.side_effect = [FakeResponse(503, {}), FakeResponse(503, {"error": {"code": 503}})]
-        response = self.post_unmarked()
-        self.assertEqual(response.get_json(), {"error": {"code": 503}})
-        post.side_effect = [api.requests.Timeout("a"), api.requests.Timeout("b")]
-        self.assertEqual(self.post_unmarked().status_code, 502)
+    def test_unmarked_both_models_failing_without_backup_key_is_one_502(self, post):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "gemini-test"}):
+            os.environ.pop("OPENROUTER_API_KEY", None)
+            post.side_effect = [FakeResponse(503, {}), FakeResponse(503, {"error": {"code": 503}})]
+            response = self.post(self.UNMARKED)
+            self.assertEqual((response.status_code, response.get_json()), (502, {"error": "Upstream error"}))
+            post.side_effect = [api.requests.Timeout("a"), api.requests.Timeout("b")]
+            self.assertEqual(self.post(self.UNMARKED).status_code, 502)
+            self.assertEqual(post.call_count, 4)
 
 
 if __name__ == "__main__":
