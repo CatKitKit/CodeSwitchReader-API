@@ -77,8 +77,10 @@ class SongBakeTest(unittest.TestCase):
 
     def test_launch_language_list_is_exact_and_every_language_is_accepted(self):
         expected = {
-            "English", "French", "German", "Hindi",
-            "Japanese", "Korean", "Portuguese", "Spanish",
+            "Arabic", "Czech", "Dutch", "English", "French", "German", "Greek",
+            "Hindi", "Hungarian", "Indonesian", "Italian", "Japanese", "Korean",
+            "Mandarin", "Portuguese", "Romanian", "Russian", "Spanish", "Swedish",
+            "Tagalog", "Thai", "Turkish", "Ukrainian", "Vietnamese",
         }
         self.assertEqual(api.SONG_LANGUAGES, expected)
         for language in expected:
@@ -89,10 +91,17 @@ class SongBakeTest(unittest.TestCase):
                 })
                 self.assertIsNotNone(fields)
                 self.assertEqual(fields["targetLanguage"], language)
+        ar_prompt = api._song_prompt({
+            **self.payload,
+            "targetLanguage": "Arabic",
+            "voice": "female",
+        })
+        self.assertIn("tashkīl", ar_prompt)
 
     def test_unsupported_or_malformed_languages_never_reach_or_spend_provider(self):
         invalid = [
-            "Mandarin", "Russian", "Thai", "english", "English (US)",
+            "Cantonese", "Polish", "Hebrew", "Persian", "Punjabi", "Malay",
+            "english", "English (US)",
             "", None, {"name": "Spanish"}, ["Spanish"],
         ]
         with patch.dict(os.environ, {"LYRIA_API_KEY": "provider-key"}), patch.object(

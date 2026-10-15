@@ -133,8 +133,10 @@ SONG_ALLOWED_PAYLOAD_KEYS = {"lyrics", "targetLanguage", "style", "mood"}
 SONG_OPTIONAL_PAYLOAD_KEYS = {"voice"}
 SONG_VOICES = {"female": "a female lead singer", "male": "a male lead singer"}
 SONG_LANGUAGES = frozenset({
-    "English", "French", "German", "Hindi",
-    "Japanese", "Korean", "Portuguese", "Spanish",
+    "Arabic", "Czech", "Dutch", "English", "French", "German", "Greek",
+    "Hindi", "Hungarian", "Indonesian", "Italian", "Japanese", "Korean",
+    "Mandarin", "Portuguese", "Romanian", "Russian", "Spanish", "Swedish",
+    "Tagalog", "Thai", "Turkish", "Ukrainian", "Vietnamese",
 })
 SONG_STYLES = {
     "pop", "acoustic", "dance", "lullaby", "folk", "ballad", "rap", "marching"
@@ -330,9 +332,14 @@ def _song_prompt(fields):
     singer = SONG_VOICES.get(fields.get("voice", ""))
     vocals = f"Sung by {singer}, with warm, clearly articulated vocals." if singer \
         else "Use warm, clearly articulated vocals."
+    arabic_note = (
+        "Follow every written Arabic vowel diacritic (tashkīl / harakāt) as written. "
+        if fields.get("targetLanguage") == "Arabic" else ""
+    )
     return (
         f"Create an approximately 90-second {fields['mood']} {fields['style']} song "
         f"for a learner of {fields['targetLanguage']}. {vocals} "
+        f"{arabic_note}"
         "Sing exactly the supplied lyrics: do not add, remove, translate, "
         "repeat beyond the written repeats, or rewrite any lyric line. Treat the "
         "square-bracketed section markers as structure, not words to sing. Do not "
