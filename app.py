@@ -60,9 +60,14 @@ MAX_BODY_BYTES = 50 * 1024
 # of Gemini, so they get no second Gemini model (Kit, 2026-10-07).
 GEMINI_FLASH_LITE_MODEL = "gemini-3.5-flash-lite"
 AI_PROXY_MODELS = (GEMINI_FLASH_LITE_MODEL, "gemini-3.1-flash-lite")
-# When every Gemini model fails, Gemma 4 31B on ModelRun answers instead: as fast as
-# Flash-Lite with comparable language quality (bench 2026-10-07). Translations go to it
-# FIRST: Gemma translated idioms better and costs less (Kit, 2026-10-07).
+# Non-Cantonese Studio/lesson calls go to OpenAI gpt-6-luna first when OPENAI_API_KEY is
+# configured, falling back to Gemma 4 31B on ModelRun and then Gemini 3.5/3.1 Flash-Lite.
+# Cantonese stays on Gemini 3.5 Flash-Lite first (Kit, 2026-10-16).
+# Translations go to Gemma 4 31B on ModelRun first for speed in Story->Translate chains,
+# falling back to Gemini 3.5/3.1 Flash-Lite and then Luna.
+OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
+OPENAI_LUNA_MODEL = "gpt-6-luna"
+OPENAI_LUNA_REASONING_EFFORT = "low"
 BACKUP_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 BACKUP_OPENROUTER_PROVIDER = "modelrun"
 BACKUP_OPENROUTER_MODEL = "google/gemma-4-31b-it"
@@ -929,11 +934,7 @@ def _is_openrouter_block(error):
     return error.get("code") == 403 or "content_policy" in kind or "moderation" in kind
 
 
-def _openrouter_backup(api_key, payload):
-    """The phone's Gemini-shaped request answered by Gemma: a Gemini-shaped dict, BACKUP_BLOCKED
-    when the provider refused the content (final: never retry it elsewhere), or None."""
-    if not api_key:
-        return None
+def _chat_messages(payload):
     messages = []
     system = _payload_text(payload.get("systemInstruction"))
     if system.strip():
@@ -943,7 +944,84 @@ def _openrouter_backup(api_key, payload):
         if text.strip():
             role = "assistant" if isinstance(content, dict) and content.get("role") == "model" else "user"
             messages.append({"role": role, "content": text})
-    if not any(m["role"] == "user" for m in messages):
+    return messages if any(m["role"] == "user" for m in messages) else []
+
+
+def _is_cantonese_payload(payload):
+    """Cantonese stays on Gemini 3.5 Flash-Lite first (Kit, 2026-10-16). Every Cantonese
+    Studio, translation, and lesson prompt in mobile.js appends cantoneseRegisterRule()."""
+    for content in payload.get("contents") or []:
+        if "SPOKEN Cantonese (yue)" in _payload_text(content):
+            return True
+    return False
+
+
+def _openai_luna(api_key, payload):
+    """Direct OpenAI gpt-6-luna call returning a Gemini-shaped dict, BACKUP_BLOCKED on
+    content refusal (final: never retry elsewhere), or None on transient/upstream error."""
+    if not api_key or not _valid_text_payload(payload):
+        return None
+    messages = _chat_messages(payload)
+    if not messages:
+        return None
+    generation = payload.get("generationConfig")
+    wants_json = isinstance(generation, dict) and generation.get("responseMimeType") == "application/json"
+    body = {
+        "model": OPENAI_LUNA_MODEL,
+        "messages": messages,
+        "max_completion_tokens": BACKUP_MAX_TOKENS,
+        "reasoning_effort": OPENAI_LUNA_REASONING_EFFORT,
+        "stream": False,
+    }
+    if wants_json:
+        body["response_format"] = {"type": "json_object"}
+    try:
+        response = requests.post(
+            OPENAI_CHAT_URL,
+            headers={"Authorization": f"Bearer {api_key}"},
+            json=body,
+            timeout=(3.05, 45),
+        )
+        if response.status_code != 200:
+            app.logger.warning("ai-proxy openai=%s status=%s", OPENAI_LUNA_MODEL, response.status_code)
+            return None
+        data = response.json()
+    except requests.Timeout:
+        app.logger.warning("ai-proxy openai=%s timeout", OPENAI_LUNA_MODEL)
+        return None
+    except (requests.RequestException, ValueError):
+        app.logger.warning("ai-proxy openai=%s request failed", OPENAI_LUNA_MODEL)
+        return None
+    choices = data.get("choices") if isinstance(data, dict) else None
+    choice = choices[0] if isinstance(choices, list) and choices else None
+    if not isinstance(choice, dict):
+        return None
+    message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+    if choice.get("finish_reason") == "content_filter" or message.get("refusal"):
+        return BACKUP_BLOCKED
+    if choice.get("finish_reason") != "stop":
+        return None
+    text = message.get("content")
+    if not isinstance(text, str) or not text.strip():
+        return None
+    if wants_json and ("{" not in text or "}" not in text):
+        return None
+    return {
+        "candidates": [{
+            "content": {"role": "model", "parts": [{"text": text}]},
+            "finishReason": "STOP",
+        }],
+        "modelVersion": OPENAI_LUNA_MODEL,
+    }
+
+
+def _openrouter_backup(api_key, payload):
+    """The phone's Gemini-shaped request answered by Gemma: a Gemini-shaped dict, BACKUP_BLOCKED
+    when the provider refused the content (final: never retry it elsewhere), or None."""
+    if not api_key:
+        return None
+    messages = _chat_messages(payload)
+    if not messages:
         return None
     generation = payload.get("generationConfig")
     wants_json = isinstance(generation, dict) and generation.get("responseMimeType") == "application/json"
@@ -1012,15 +1090,20 @@ def _ai_translation(payload):
     plain = {key: value for key, value in payload.items() if key != "purpose"}
     openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
-    if not openrouter_key and not gemini_key:
+    openai_key = os.environ.get("OPENAI_API_KEY", "")
+    if not openrouter_key and not gemini_key and not openai_key:
         return jsonify({"error": "Server not configured"}), 503
     backup = _openrouter_backup(openrouter_key, plain)
     if backup:
         return jsonify(backup)
-    if not gemini_key:
-        return jsonify({"error": "Upstream error"}), 502
-    answer = _gemini_chain(gemini_key, plain)
-    return answer if answer is not None else (jsonify({"error": "Upstream error"}), 502)
+    if gemini_key:
+        answer = _gemini_chain(gemini_key, plain)
+        if answer is not None:
+            return answer
+    luna = _openai_luna(openai_key, plain)
+    if luna:
+        return jsonify(luna)
+    return jsonify({"error": "Upstream error"}), 502
 
 
 # Initialize the IPA generator for Russian and Arabic
@@ -1104,13 +1187,33 @@ def ai_proxy():
     try:
         if payload.get("purpose") == TRANSLATION_PURPOSE:
             return _ai_translation(payload)
-        api_key = os.environ.get('GEMINI_API_KEY')
-        if not api_key:
+        openai_key = os.environ.get("OPENAI_API_KEY", "")
+        openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
+        gemini_key = os.environ.get("GEMINI_API_KEY", "")
+        if not openai_key and not gemini_key and not openrouter_key:
             return jsonify({"error": "Server not configured"}), 503
-        answer = _gemini_chain(api_key, payload)
-        if answer is not None:
-            return answer
-        backup = _openrouter_backup(os.environ.get("OPENROUTER_API_KEY", ""), payload)
+        if openai_key and not _is_cantonese_payload(payload):
+            if not _valid_text_payload(payload):
+                return jsonify({"error": "Bad request"}), 400
+            luna = _openai_luna(openai_key, payload)
+            if luna:
+                return jsonify(luna)
+            backup = _openrouter_backup(openrouter_key, payload)
+            if backup:
+                return jsonify(backup)
+            if gemini_key:
+                answer = _gemini_chain(gemini_key, payload)
+                if answer is not None:
+                    return answer
+            return jsonify({"error": "Upstream error"}), 502
+        if gemini_key:
+            answer = _gemini_chain(gemini_key, payload)
+            if answer is not None:
+                return answer
+        luna = _openai_luna(openai_key, payload)
+        if luna:
+            return jsonify(luna)
+        backup = _openrouter_backup(openrouter_key, payload)
         if backup:
             return jsonify(backup)
         return jsonify({"error": "Upstream error"}), 502

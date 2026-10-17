@@ -30,7 +30,7 @@ class AiBackupTest(unittest.TestCase):
 
     def post(self, payload, env=KEYS):
         with patch.dict(os.environ, env, clear=False):
-            for name in set(KEYS) - set(env):
+            for name in (set(KEYS) | {"OPENAI_API_KEY"}) - set(env):
                 os.environ.pop(name, None)
             return self.client.post("/ai-proxy", json=payload, headers={"X-App-Key": "test-app-key"})
 
@@ -39,6 +39,72 @@ class AiBackupTest(unittest.TestCase):
         data = response.get_json()
         self.assertEqual(data["candidates"][0]["content"]["parts"][0]["text"], text)
         self.assertIn("modelrun", data["modelVersion"])
+
+    def assert_luna_answer(self, response, text):
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["candidates"][0]["content"]["parts"][0]["text"], text)
+        self.assertEqual(data["modelVersion"], "gpt-6-luna")
+
+    @patch.object(api.requests, "post")
+    def test_luna_first_when_openai_key_is_set_falling_back_to_gemma_then_gemini(self, post):
+        all_keys = {**KEYS, "OPENAI_API_KEY": "oa-test"}
+        post.side_effect = [openrouter_response("luna story")]
+        response = self.post(STORY, env=all_keys)
+        self.assert_luna_answer(response, "luna story")
+        self.assertEqual(post.call_count, 1)
+        url, body = post.call_args.args[0], post.call_args.kwargs["json"]
+        self.assertEqual(url, "https://api.openai.com/v1/chat/completions")
+        self.assertEqual(body["model"], "gpt-6-luna")
+        self.assertEqual(body["reasoning_effort"], "low")
+        self.assertEqual(body["max_completion_tokens"], 8192)
+
+        # Luna fails -> Gemma on ModelRun answers
+        post.reset_mock()
+        post.side_effect = [FakeResponse(503, {}), openrouter_response("gemma fallback")]
+        response = self.post(STORY, env=all_keys)
+        self.assert_gemma_answer(response, "gemma fallback")
+        self.assertEqual(post.call_count, 2)
+
+        # Luna and Gemma both fail -> Gemini 3.5 answers
+        post.reset_mock()
+        post.side_effect = [FakeResponse(503, {}), FakeResponse(503, {}), FakeResponse(200, GEMINI_OK)]
+        response = self.post(STORY, env=all_keys)
+        self.assertEqual(response.get_json(), GEMINI_OK)
+        self.assertEqual(post.call_count, 3)
+        self.assertIn("gemini-3.5-flash-lite", post.call_args_list[2].args[0])
+
+    @patch.object(api.requests, "post")
+    def test_cantonese_stays_on_gemini_first_even_with_openai_key(self, post):
+        all_keys = {**KEYS, "OPENAI_API_KEY": "oa-test"}
+        yue_story = {
+            "contents": [{"parts": [{"text": "Write a story.\n- Mind the register: Cantonese means SPOKEN Cantonese (yue)"}]}],
+            "systemInstruction": {"parts": [{"text": "You are an expert story writer."}]},
+        }
+        post.side_effect = [FakeResponse(200, GEMINI_OK)]
+        response = self.post(yue_story, env=all_keys)
+        self.assertEqual(response.get_json(), GEMINI_OK)
+        self.assertEqual(post.call_count, 1)
+        self.assertIn("gemini-3.5-flash-lite", post.call_args.args[0])
+
+        # If Gemini is down for Cantonese, falls back to Luna
+        post.reset_mock()
+        post.side_effect = [FakeResponse(503, {}), FakeResponse(503, {}), openrouter_response("luna yue backup")]
+        response = self.post(yue_story, env=all_keys)
+        self.assert_luna_answer(response, "luna yue backup")
+
+    @patch.object(api.requests, "post")
+    def test_luna_content_refusal_is_final_never_retried(self, post):
+        all_keys = {**KEYS, "OPENAI_API_KEY": "oa-test"}
+        refusal_resp = FakeResponse(200, {
+            "choices": [{"message": {"content": None, "refusal": "Cannot fulfill."}, "finish_reason": "stop"}]
+        })
+        for blocked in (openrouter_response("", finish_reason="content_filter"), refusal_resp):
+            post.reset_mock()
+            post.side_effect = [blocked]
+            response = self.post(STORY, env=all_keys)
+            self.assertEqual(post.call_count, 1)
+            self.assertEqual(response.get_json(), api.BACKUP_BLOCKED)
 
     @patch.object(api.requests, "post")
     def test_google_down_falls_to_pinned_private_modelrun(self, post):
