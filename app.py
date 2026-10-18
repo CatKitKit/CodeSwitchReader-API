@@ -55,25 +55,27 @@ MAX_BODY_BYTES = 50 * 1024
 # AI Context explanations alone use the slower, quality-first provider chain. The
 # phone marks only that request; summaries, Studios, lessons, and translations keep
 # the ordinary Gemini-only /ai-proxy path below.
-# Ordinary /ai-proxy calls fall from 3.8 Flash to 3.5 Flash-Lite on busy/down errors.
-# Dictionary and context already have OpenRouter in front of Gemini, so they get no
-# second Gemini model (Kit, 2026-10-07 / 2026-10-17).
-GEMINI_PRIMARY_MODEL = "gemini-3.8-flash"
-GEMINI_FALLBACK_MODEL = "gemini-3.5-flash-lite"
-GEMINI_FLASH_LITE_MODEL = GEMINI_PRIMARY_MODEL
-GEMINI_THINKING_LEVEL = "low"
-AI_PROXY_MODELS = (GEMINI_PRIMARY_MODEL, GEMINI_FALLBACK_MODEL)
+# Direct generativelanguage.googleapis.com calls stay on 3.5 -> 3.1 Flash-Lite because
+# AI Studio's 3.8-flash endpoint hangs/503s, whereas OpenRouter's google-vertex route
+# serves google/gemini-3.8-flash on provisioned Vertex capacity (2026-10-17).
+GEMINI_FLASH_LITE_MODEL = "gemini-3.5-flash-lite"
+AI_PROXY_MODELS = (GEMINI_FLASH_LITE_MODEL, "gemini-3.1-flash-lite")
 # Non-Cantonese Studio/lesson calls go to OpenAI gpt-6-luna first when OPENAI_API_KEY is
-# configured, falling back to Gemma 4 31B on ModelRun and then Gemini 3.8/3.5.
-# Cantonese stays on Gemini 3.8 Flash first (Kit, 2026-10-16 / 2026-10-17).
+# configured, falling back to Gemma 4 31B on ModelRun, Gemini 3.8 Flash on Vertex
+# (OpenRouter), and then Gemini 3.5/3.1 Flash-Lite.
+# Cantonese goes to Gemini 3.8 Flash on Vertex (OpenRouter) first when OPENROUTER_API_KEY
+# is configured, falling back to Gemini 3.5/3.1 Flash-Lite, Luna, and Gemma.
 # Translations go to Gemma 4 31B on ModelRun first for speed in Story->Translate chains,
-# falling back to Gemini 3.8/3.5 and then Luna.
+# falling back to Gemini 3.8 Flash (Vertex), Gemini 3.5/3.1 Flash-Lite, and then Luna.
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
 OPENAI_LUNA_MODEL = "gpt-6-luna"
 OPENAI_LUNA_REASONING_EFFORT = "low"
 BACKUP_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 BACKUP_OPENROUTER_PROVIDER = "modelrun"
 BACKUP_OPENROUTER_MODEL = "google/gemma-4-31b-it"
+GEMINI_38_OPENROUTER_PROVIDER = "google-vertex"
+GEMINI_38_OPENROUTER_MODEL = "google/gemini-3.8-flash"
+GEMINI_38_REASONING_EFFORT = "low"
 BACKUP_MAX_TOKENS = 8192
 TRANSLATION_PURPOSE = "translation"
 TRANSLATION_ALLOWED_KEYS = {"contents", "systemInstruction", "purpose"}
@@ -567,7 +569,7 @@ def _gemini_dict_lookup(api_key, system, prompt):
         "systemInstruction": {"parts": [{"text": system}]},
         "generationConfig": {
             "maxOutputTokens": 256,
-            "thinkingConfig": {"thinkingLevel": GEMINI_THINKING_LEVEL},
+            "thinkingConfig": {"thinkingLevel": "minimal"},
         },
     }
     response = requests.post(
@@ -732,7 +734,7 @@ def _gemini_context_response(api_key, payload):
     )
     gemini_payload = dict(payload)
     generation = dict(gemini_payload.get("generationConfig") or {})
-    generation["thinkingConfig"] = {"thinkingLevel": GEMINI_THINKING_LEVEL}
+    generation["thinkingConfig"] = {"thinkingLevel": "minimal"}
     gemini_payload["generationConfig"] = generation
     return requests.post(
         url,
@@ -873,11 +875,7 @@ def _gemini_retryable(status):
 
 
 def _gemini_chain(api_key, payload):
-    """Gemini 3.8 then 3.5. A response is final; None means every model was busy/down."""
-    gemini_payload = dict(payload)
-    generation = dict(gemini_payload.get("generationConfig") or {})
-    generation["thinkingConfig"] = {"thinkingLevel": GEMINI_THINKING_LEVEL}
-    gemini_payload["generationConfig"] = generation
+    """Gemini 3.5 then 3.1. A response is final; None means every model was busy/down."""
     for model in AI_PROXY_MODELS:
         url = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -887,7 +885,7 @@ def _gemini_chain(api_key, payload):
             response = requests.post(
                 url,
                 headers={"x-goog-api-key": api_key},
-                json=gemini_payload,
+                json=payload,
                 timeout=30,
             )
         except requests.Timeout:
@@ -1022,9 +1020,11 @@ def _openai_luna(api_key, payload):
     }
 
 
-def _openrouter_backup(api_key, payload):
-    """The phone's Gemini-shaped request answered by Gemma: a Gemini-shaped dict, BACKUP_BLOCKED
-    when the provider refused the content (final: never retry it elsewhere), or None."""
+def _openrouter_backup(api_key, payload, provider=BACKUP_OPENROUTER_PROVIDER,
+                       model=BACKUP_OPENROUTER_MODEL, reasoning_effort=None):
+    """The phone's Gemini-shaped request answered via OpenRouter (Gemma on ModelRun or
+    Gemini 3.8 Flash on Vertex): a Gemini-shaped dict, BACKUP_BLOCKED when the provider
+    refused the content (final: never retry it elsewhere), or None."""
     if not api_key:
         return None
     messages = _chat_messages(payload)
@@ -1033,7 +1033,7 @@ def _openrouter_backup(api_key, payload):
     generation = payload.get("generationConfig")
     wants_json = isinstance(generation, dict) and generation.get("responseMimeType") == "application/json"
     body = {
-        "model": BACKUP_OPENROUTER_MODEL,
+        "model": model,
         "messages": messages,
         "max_tokens": BACKUP_MAX_TOKENS,
         "stream": False,
@@ -1041,13 +1041,15 @@ def _openrouter_backup(api_key, payload):
         # mode (bench 2026-07-12). The lesson prompt already demands JSON, and the phone's
         # parser strips fences.
         "provider": {
-            "only": [BACKUP_OPENROUTER_PROVIDER],
-            "order": [BACKUP_OPENROUTER_PROVIDER],
+            "only": [provider],
+            "order": [provider],
             "allow_fallbacks": False,
             "zdr": True,
             "data_collection": "deny",
         },
     }
+    if reasoning_effort:
+        body["reasoning"] = {"effort": reasoning_effort}
     try:
         response = requests.post(
             BACKUP_OPENROUTER_URL,
@@ -1056,15 +1058,15 @@ def _openrouter_backup(api_key, payload):
             timeout=(3.05, 45),
         )
         if response.status_code != 200:
-            app.logger.warning("ai-proxy backup=%s status=%s", BACKUP_OPENROUTER_PROVIDER, response.status_code)
+            app.logger.warning("ai-proxy backup=%s status=%s", provider, response.status_code)
             # OpenRouter's 403 = moderation flagged the input.
             return BACKUP_BLOCKED if response.status_code == 403 else None
         data = response.json()
     except requests.Timeout:
-        app.logger.warning("ai-proxy backup=%s timeout", BACKUP_OPENROUTER_PROVIDER)
+        app.logger.warning("ai-proxy backup=%s timeout", provider)
         return None
     except (requests.RequestException, ValueError):
-        app.logger.warning("ai-proxy backup=%s request failed", BACKUP_OPENROUTER_PROVIDER)
+        app.logger.warning("ai-proxy backup=%s request failed", provider)
         return None
     if isinstance(data, dict) and _is_openrouter_block(data.get("error")):
         return BACKUP_BLOCKED
@@ -1087,8 +1089,20 @@ def _openrouter_backup(api_key, payload):
             "content": {"role": "model", "parts": [{"text": text}]},
             "finishReason": "STOP",
         }],
-        "modelVersion": f"{BACKUP_OPENROUTER_MODEL} ({BACKUP_OPENROUTER_PROVIDER})",
+        "modelVersion": f"{model} ({provider})",
     }
+
+
+def _openrouter_gemini_38(api_key, payload):
+    if not api_key or not _valid_text_payload(payload):
+        return None
+    return _openrouter_backup(
+        api_key,
+        payload,
+        provider=GEMINI_38_OPENROUTER_PROVIDER,
+        model=GEMINI_38_OPENROUTER_MODEL,
+        reasoning_effort=GEMINI_38_REASONING_EFFORT,
+    )
 
 
 def _ai_translation(payload):
@@ -1199,6 +1213,12 @@ def ai_proxy():
         gemini_key = os.environ.get("GEMINI_API_KEY", "")
         if not openai_key and not gemini_key and not openrouter_key:
             return jsonify({"error": "Server not configured"}), 503
+        if _is_cantonese_payload(payload) and openrouter_key:
+            if not _valid_text_payload(payload):
+                return jsonify({"error": "Bad request"}), 400
+            g38 = _openrouter_gemini_38(openrouter_key, payload)
+            if g38:
+                return jsonify(g38)
         if openai_key and not _is_cantonese_payload(payload):
             if not _valid_text_payload(payload):
                 return jsonify({"error": "Bad request"}), 400
@@ -1208,6 +1228,9 @@ def ai_proxy():
             backup = _openrouter_backup(openrouter_key, payload)
             if backup:
                 return jsonify(backup)
+            g38 = _openrouter_gemini_38(openrouter_key, payload)
+            if g38:
+                return jsonify(g38)
             if gemini_key:
                 answer = _gemini_chain(gemini_key, payload)
                 if answer is not None:

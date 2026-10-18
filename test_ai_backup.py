@@ -66,17 +66,23 @@ class AiBackupTest(unittest.TestCase):
         self.assert_gemma_answer(response, "gemma fallback")
         self.assertEqual(post.call_count, 2)
 
-        # Luna and Gemma both fail -> Gemini 3.8 answers
+        # Luna and Gemma both fail -> Gemini 3.8 on Vertex (OpenRouter) answers
         post.reset_mock()
-        post.side_effect = [FakeResponse(503, {}), FakeResponse(503, {}), FakeResponse(200, GEMINI_OK)]
+        post.side_effect = [FakeResponse(503, {}), FakeResponse(503, {}), openrouter_response("g38 fallback")]
+        response = self.post(STORY, env=all_keys)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["modelVersion"], "google/gemini-3.8-flash (google-vertex)")
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual(post.call_args_list[2].kwargs["json"]["model"], "google/gemini-3.8-flash")
+        self.assertEqual(post.call_args_list[2].kwargs["json"]["reasoning"], {"effort": "low"})
+
+        # Luna, Gemma, and Vertex 3.8 all fail -> Gemini 3.5 Flash-Lite answers
+        post.reset_mock()
+        post.side_effect = [FakeResponse(503, {}), FakeResponse(503, {}), FakeResponse(503, {}), FakeResponse(200, GEMINI_OK)]
         response = self.post(STORY, env=all_keys)
         self.assertEqual(response.get_json(), GEMINI_OK)
-        self.assertEqual(post.call_count, 3)
-        self.assertIn("gemini-3.8-flash", post.call_args_list[2].args[0])
-        self.assertEqual(
-            post.call_args_list[2].kwargs["json"]["generationConfig"]["thinkingConfig"],
-            {"thinkingLevel": "low"},
-        )
+        self.assertEqual(post.call_count, 4)
+        self.assertIn("gemini-3.5-flash-lite", post.call_args_list[3].args[0])
 
     @patch.object(api.requests, "post")
     def test_cantonese_stays_on_gemini_first_even_with_openai_key(self, post):
@@ -85,19 +91,22 @@ class AiBackupTest(unittest.TestCase):
             "contents": [{"parts": [{"text": "Write a story.\n- Mind the register: Cantonese means SPOKEN Cantonese (yue)"}]}],
             "systemInstruction": {"parts": [{"text": "You are an expert story writer."}]},
         }
-        post.side_effect = [FakeResponse(200, GEMINI_OK)]
+        post.side_effect = [openrouter_response("g38 yue story")]
         response = self.post(yue_story, env=all_keys)
-        self.assertEqual(response.get_json(), GEMINI_OK)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["modelVersion"], "google/gemini-3.8-flash (google-vertex)")
         self.assertEqual(post.call_count, 1)
-        self.assertIn("gemini-3.8-flash", post.call_args.args[0])
-        self.assertEqual(
-            post.call_args.kwargs["json"]["generationConfig"]["thinkingConfig"],
-            {"thinkingLevel": "low"},
-        )
+        body = post.call_args.kwargs["json"]
+        self.assertEqual(body["model"], "google/gemini-3.8-flash")
+        self.assertEqual(body["reasoning"], {"effort": "low"})
+        self.assertEqual(body["provider"], {
+            "only": ["google-vertex"], "order": ["google-vertex"],
+            "allow_fallbacks": False, "zdr": True, "data_collection": "deny",
+        })
 
-        # If Gemini is down for Cantonese, falls back to Luna
+        # If Vertex 3.8 and direct Gemini are down for Cantonese, falls back to Luna
         post.reset_mock()
-        post.side_effect = [FakeResponse(503, {}), FakeResponse(503, {}), openrouter_response("luna yue backup")]
+        post.side_effect = [FakeResponse(503, {}), FakeResponse(503, {}), FakeResponse(503, {}), openrouter_response("luna yue backup")]
         response = self.post(yue_story, env=all_keys)
         self.assert_luna_answer(response, "luna yue backup")
 
@@ -168,7 +177,7 @@ class AiBackupTest(unittest.TestCase):
         response = self.post(TRANSLATION)
         self.assertEqual(response.get_json(), GEMINI_OK)
         gemini = post.call_args_list[1]
-        self.assertIn("gemini-3.8-flash", gemini.args[0])
+        self.assertIn("gemini-3.5-flash-lite", gemini.args[0])
         self.assertNotIn("purpose", gemini.kwargs["json"])
 
     @patch.object(api.requests, "post")
@@ -210,7 +219,7 @@ class AiBackupTest(unittest.TestCase):
             post.reset_mock()
             post.side_effect = [FakeResponse(status, {}), FakeResponse(200, GEMINI_OK)]
             self.assertEqual(self.post(STORY).get_json(), GEMINI_OK)
-            self.assertIn("gemini-3.5-flash-lite", post.call_args_list[1].args[0])
+            self.assertIn("gemini-3.1-flash-lite", post.call_args_list[1].args[0])
 
 
 if __name__ == "__main__":
