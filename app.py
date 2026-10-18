@@ -55,16 +55,19 @@ MAX_BODY_BYTES = 50 * 1024
 # AI Context explanations alone use the slower, quality-first provider chain. The
 # phone marks only that request; summaries, Studios, lessons, and translations keep
 # the ordinary Gemini-only /ai-proxy path below.
-# Ordinary /ai-proxy calls fall to 3.1 on busy/down errors: 3.5 overloaded on the
-# free tier on 2026-09-28. Dictionary and context already have OpenRouter in front
-# of Gemini, so they get no second Gemini model (Kit, 2026-10-07).
-GEMINI_FLASH_LITE_MODEL = "gemini-3.5-flash-lite"
-AI_PROXY_MODELS = (GEMINI_FLASH_LITE_MODEL, "gemini-3.1-flash-lite")
+# Ordinary /ai-proxy calls fall from 3.8 Flash to 3.5 Flash-Lite on busy/down errors.
+# Dictionary and context already have OpenRouter in front of Gemini, so they get no
+# second Gemini model (Kit, 2026-10-07 / 2026-10-17).
+GEMINI_PRIMARY_MODEL = "gemini-3.8-flash"
+GEMINI_FALLBACK_MODEL = "gemini-3.5-flash-lite"
+GEMINI_FLASH_LITE_MODEL = GEMINI_PRIMARY_MODEL
+GEMINI_THINKING_LEVEL = "low"
+AI_PROXY_MODELS = (GEMINI_PRIMARY_MODEL, GEMINI_FALLBACK_MODEL)
 # Non-Cantonese Studio/lesson calls go to OpenAI gpt-6-luna first when OPENAI_API_KEY is
-# configured, falling back to Gemma 4 31B on ModelRun and then Gemini 3.5/3.1 Flash-Lite.
-# Cantonese stays on Gemini 3.5 Flash-Lite first (Kit, 2026-10-16).
+# configured, falling back to Gemma 4 31B on ModelRun and then Gemini 3.8/3.5.
+# Cantonese stays on Gemini 3.8 Flash first (Kit, 2026-10-16 / 2026-10-17).
 # Translations go to Gemma 4 31B on ModelRun first for speed in Story->Translate chains,
-# falling back to Gemini 3.5/3.1 Flash-Lite and then Luna.
+# falling back to Gemini 3.8/3.5 and then Luna.
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
 OPENAI_LUNA_MODEL = "gpt-6-luna"
 OPENAI_LUNA_REASONING_EFFORT = "low"
@@ -564,7 +567,7 @@ def _gemini_dict_lookup(api_key, system, prompt):
         "systemInstruction": {"parts": [{"text": system}]},
         "generationConfig": {
             "maxOutputTokens": 256,
-            "thinkingConfig": {"thinkingLevel": "minimal"},
+            "thinkingConfig": {"thinkingLevel": GEMINI_THINKING_LEVEL},
         },
     }
     response = requests.post(
@@ -729,7 +732,7 @@ def _gemini_context_response(api_key, payload):
     )
     gemini_payload = dict(payload)
     generation = dict(gemini_payload.get("generationConfig") or {})
-    generation["thinkingConfig"] = {"thinkingLevel": "minimal"}
+    generation["thinkingConfig"] = {"thinkingLevel": GEMINI_THINKING_LEVEL}
     gemini_payload["generationConfig"] = generation
     return requests.post(
         url,
@@ -870,7 +873,11 @@ def _gemini_retryable(status):
 
 
 def _gemini_chain(api_key, payload):
-    """Gemini 3.5 then 3.1. A response is final; None means every model was busy/down."""
+    """Gemini 3.8 then 3.5. A response is final; None means every model was busy/down."""
+    gemini_payload = dict(payload)
+    generation = dict(gemini_payload.get("generationConfig") or {})
+    generation["thinkingConfig"] = {"thinkingLevel": GEMINI_THINKING_LEVEL}
+    gemini_payload["generationConfig"] = generation
     for model in AI_PROXY_MODELS:
         url = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -880,7 +887,7 @@ def _gemini_chain(api_key, payload):
             response = requests.post(
                 url,
                 headers={"x-goog-api-key": api_key},
-                json=payload,
+                json=gemini_payload,
                 timeout=30,
             )
         except requests.Timeout:

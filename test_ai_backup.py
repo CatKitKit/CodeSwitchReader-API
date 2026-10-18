@@ -66,13 +66,17 @@ class AiBackupTest(unittest.TestCase):
         self.assert_gemma_answer(response, "gemma fallback")
         self.assertEqual(post.call_count, 2)
 
-        # Luna and Gemma both fail -> Gemini 3.5 answers
+        # Luna and Gemma both fail -> Gemini 3.8 answers
         post.reset_mock()
         post.side_effect = [FakeResponse(503, {}), FakeResponse(503, {}), FakeResponse(200, GEMINI_OK)]
         response = self.post(STORY, env=all_keys)
         self.assertEqual(response.get_json(), GEMINI_OK)
         self.assertEqual(post.call_count, 3)
-        self.assertIn("gemini-3.5-flash-lite", post.call_args_list[2].args[0])
+        self.assertIn("gemini-3.8-flash", post.call_args_list[2].args[0])
+        self.assertEqual(
+            post.call_args_list[2].kwargs["json"]["generationConfig"]["thinkingConfig"],
+            {"thinkingLevel": "low"},
+        )
 
     @patch.object(api.requests, "post")
     def test_cantonese_stays_on_gemini_first_even_with_openai_key(self, post):
@@ -85,7 +89,11 @@ class AiBackupTest(unittest.TestCase):
         response = self.post(yue_story, env=all_keys)
         self.assertEqual(response.get_json(), GEMINI_OK)
         self.assertEqual(post.call_count, 1)
-        self.assertIn("gemini-3.5-flash-lite", post.call_args.args[0])
+        self.assertIn("gemini-3.8-flash", post.call_args.args[0])
+        self.assertEqual(
+            post.call_args.kwargs["json"]["generationConfig"]["thinkingConfig"],
+            {"thinkingLevel": "low"},
+        )
 
         # If Gemini is down for Cantonese, falls back to Luna
         post.reset_mock()
@@ -160,7 +168,7 @@ class AiBackupTest(unittest.TestCase):
         response = self.post(TRANSLATION)
         self.assertEqual(response.get_json(), GEMINI_OK)
         gemini = post.call_args_list[1]
-        self.assertIn("gemini-3.5-flash-lite", gemini.args[0])
+        self.assertIn("gemini-3.8-flash", gemini.args[0])
         self.assertNotIn("purpose", gemini.kwargs["json"])
 
     @patch.object(api.requests, "post")
@@ -202,7 +210,7 @@ class AiBackupTest(unittest.TestCase):
             post.reset_mock()
             post.side_effect = [FakeResponse(status, {}), FakeResponse(200, GEMINI_OK)]
             self.assertEqual(self.post(STORY).get_json(), GEMINI_OK)
-            self.assertIn("gemini-3.1-flash-lite", post.call_args_list[1].args[0])
+            self.assertIn("gemini-3.5-flash-lite", post.call_args_list[1].args[0])
 
 
 if __name__ == "__main__":

@@ -95,7 +95,7 @@ class AiContextChainTest(unittest.TestCase):
         self.assert_contract(response)
         self.assertEqual(post.call_count, 1)
         call = post.call_args
-        self.assertIn("gemini-3.5-flash-lite", call.args[0])
+        self.assertIn("gemini-3.8-flash", call.args[0])
         self.assertNotIn("openrouter.ai", call.args[0])
         self.assertEqual(call.kwargs["headers"], {"x-goog-api-key": "gemini-test"})
         self.assertNotIn("purpose", call.kwargs["json"])
@@ -155,7 +155,7 @@ class AiContextChainTest(unittest.TestCase):
         self.assert_contract(response)
         self.assertEqual(post.call_count, 2)
         gemini = post.call_args_list[1]
-        self.assertIn("gemini-3.5-flash-lite", gemini.args[0])
+        self.assertIn("gemini-3.8-flash", gemini.args[0])
         self.assertNotIn("?key=", gemini.args[0])
         self.assertEqual(gemini.kwargs["headers"], {"x-goog-api-key": "gemini-test"})
         timeout = gemini.kwargs["timeout"]
@@ -164,7 +164,7 @@ class AiContextChainTest(unittest.TestCase):
         self.assertNotIn("purpose", gemini.kwargs["json"])
         self.assertEqual(
             gemini.kwargs["json"]["generationConfig"]["thinkingConfig"],
-            {"thinkingLevel": "minimal"},
+            {"thinkingLevel": "low"},
         )
         self.assertEqual(
             gemini.kwargs["json"]["contents"][0]["parts"][0]["text"],
@@ -360,7 +360,7 @@ class AiContextChainTest(unittest.TestCase):
             response = self.post(unmarked)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(post.call_count, 1)
-        self.assertIn("gemini-3.5-flash-lite", post.call_args.args[0])
+        self.assertIn("gemini-3.8-flash", post.call_args.args[0])
         self.assertNotIn("openrouter.ai", post.call_args.args[0])
 
     UNMARKED = {"contents": [{"parts": [{"text": "ordinary Studio prompt"}]}]}
@@ -380,8 +380,8 @@ class AiContextChainTest(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.get_json(), {"candidates": ["ok"]})
             self.assertEqual(post.call_count, 2)
-            self.assertIn("gemini-3.5-flash-lite", post.call_args_list[0].args[0])
-            self.assertIn("gemini-3.1-flash-lite", post.call_args_list[1].args[0])
+            self.assertIn("gemini-3.8-flash", post.call_args_list[0].args[0])
+            self.assertIn("gemini-3.5-flash-lite", post.call_args_list[1].args[0])
 
     @patch.object(api.requests, "post")
     def test_unmarked_client_error_is_not_retried(self, post):
