@@ -115,89 +115,92 @@ class DictFallbackTest(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         post.assert_not_called()
 
-    @patch("app.requests.post")
-    def test_primary_is_strictly_pinned_and_accepts_one_translation(self, post):
-        post.return_value = openrouter_response("cat")
-        with patch.dict(os.environ, {
-            "OPENROUTER_API_KEY": "or-test",
-            "GEMINI_API_KEY": "gemini-test",
-        }):
-            response = self.post()
+    ALL_KEYS = {"OPENROUTER_API_KEY": "or-test", "GEMINI_API_KEY": "gemini-test", "OPENAI_API_KEY": "oa-test"}
 
-        self.assertEqual(response.status_code, 200)
+    def post_all(self, payload=None):
+        with patch.dict(os.environ, self.ALL_KEYS):
+            return self.post(payload)
+
+    @patch("app.requests.post")
+    def test_luna_answers_first_with_the_exact_dictionary_prompt(self, post):
+        post.return_value = openrouter_response("cat")
+        response = self.post_all()
+
         self.assertEqual(response.get_json(), {"text": "cat", "found": True})
         self.assertEqual(post.call_count, 1)
-        request_body = post.call_args.kwargs["json"]
-        self.assertEqual(request_body["provider"], {
+        self.assertEqual(post.call_args.args[0], api.OPENAI_CHAT_URL)
+        body = post.call_args.kwargs["json"]
+        self.assertEqual(body["model"], "gpt-6-luna")
+        self.assertEqual(body["reasoning_effort"], "low")
+        self.assertEqual(body["messages"][0]["role"], "system")
+        prompt = body["messages"][1]["content"]
+        self.assertIn("ONLY 1 to 4", prompt)
+        self.assertIn("Do not invent extra translations", prompt)
+
+    @patch("app.requests.post")
+    def test_gemini_is_second(self, post):
+        post.side_effect = [FakeResponse(503, {}), gemini_response("cat")]
+        response = self.post_all()
+        self.assertEqual(response.get_json(), {"text": "cat", "found": True})
+        self.assertIn("gemini-3.8-flash", post.call_args_list[1].args[0])
+
+    @patch("app.requests.post")
+    def test_gemmas_are_last_and_strictly_pinned(self, post):
+        post.side_effect = [
+            FakeResponse(503, {}),
+            FakeResponse(500, {}),
+            FakeResponse(429, {"error": {"message": "limited"}}),
+            openrouter_response("cat"),
+        ]
+        response = self.post_all()
+
+        self.assertEqual(response.get_json(), {"text": "cat", "found": True})
+        self.assertEqual(post.call_count, 4)
+        first_gemma = post.call_args_list[2].kwargs["json"]
+        self.assertEqual(first_gemma["provider"], {
             "only": ["deepinfra"],
             "order": ["deepinfra"],
             "allow_fallbacks": False,
             "zdr": True,
             "data_collection": "deny",
         })
-        prompt = request_body["messages"][1]["content"]
-        self.assertIn("ONLY 1 to 4", prompt)
-        self.assertIn("Do not invent extra translations", prompt)
+        second_gemma = post.call_args_list[3].kwargs["json"]
+        self.assertEqual(second_gemma["provider"]["only"], ["modelrun"])
+        self.assertEqual(second_gemma["model"], "google/gemma-4-31b-it")
 
     @patch("app.requests.post")
-    def test_429_falls_through_to_modelrun(self, post):
-        post.side_effect = [
-            FakeResponse(429, {"error": {"message": "limited"}}),
-            openrouter_response("cat"),
-        ]
-        with patch.dict(os.environ, {
-            "OPENROUTER_API_KEY": "or-test",
-            "GEMINI_API_KEY": "gemini-test",
-        }):
-            response = self.post()
-
-        self.assertEqual(response.get_json(), {"text": "cat", "found": True})
-        self.assertEqual(post.call_count, 2)
-        second = post.call_args_list[1].kwargs["json"]
-        self.assertEqual(second["provider"]["only"], ["modelrun"])
-        self.assertEqual(second["model"], "google/gemma-4-31b-it")
+    def test_harder_languages_ask_gemini_first(self, post):
+        for source, target in (("ka-GE", "English"), ("zh-HK", "English"), ("fr-FR", "Tamil")):
+            with self.subTest(source=source, target=target):
+                post.reset_mock()
+                post.side_effect = [gemini_response("cat")]
+                response = self.post_all({**self.payload, "source": source, "target": target})
+                self.assertEqual(response.get_json(), {"text": "cat", "found": True})
+                self.assertIn("gemini-3.8-flash", post.call_args_list[0].args[0])
 
     @patch("app.requests.post")
-    def test_timeout_falls_through_to_modelrun(self, post):
-        post.side_effect = [api.requests.Timeout("synthetic"), openrouter_response("cat")]
-        with patch.dict(os.environ, {
-            "OPENROUTER_API_KEY": "or-test",
-            "GEMINI_API_KEY": "gemini-test",
-        }):
-            response = self.post()
-        self.assertEqual(response.get_json(), {"text": "cat", "found": True})
+    def test_a_strong_models_refusal_is_never_overruled_by_a_gemma_guess(self, post):
+        # The 10/21 bake-off: the Gemmas invent meanings for rare words instead of refusing.
+        post.side_effect = [openrouter_response(api.DICT_SENTINEL), gemini_response(api.DICT_SENTINEL)]
+        response = self.post_all()
+        self.assertEqual(response.get_json(), {"text": api.DICT_SENTINEL, "found": False})
         self.assertEqual(post.call_count, 2)
 
-    @patch("app.requests.post")
-    def test_sentinel_tries_every_rung_before_gemini_answer(self, post):
-        post.side_effect = [
-            openrouter_response(api.DICT_SENTINEL),
-            openrouter_response(api.DICT_SENTINEL),
-            gemini_response("cat"),
-        ]
-        with patch.dict(os.environ, {
-            "OPENROUTER_API_KEY": "or-test",
-            "GEMINI_API_KEY": "gemini-test",
-        }):
-            response = self.post()
+        # One refusal still lets the other strong model answer.
+        post.reset_mock()
+        post.side_effect = [openrouter_response(api.DICT_SENTINEL), gemini_response("cat")]
+        self.assertEqual(self.post_all().get_json(), {"text": "cat", "found": True})
 
-        self.assertEqual(response.get_json(), {"text": "cat", "found": True})
-        self.assertEqual(post.call_count, 3)
-        self.assertIn("gemini-3.8-flash", post.call_args_list[2].args[0])
+    @patch("app.requests.post")
+    def test_timeout_falls_through(self, post):
+        post.side_effect = [api.requests.Timeout("synthetic"), gemini_response("cat")]
+        self.assertEqual(self.post_all().get_json(), {"text": "cat", "found": True})
+        self.assertEqual(post.call_count, 2)
 
     @patch("app.requests.post")
     def test_all_sentinels_return_the_exact_contract(self, post):
-        post.side_effect = [
-            openrouter_response(api.DICT_SENTINEL),
-            openrouter_response(api.DICT_SENTINEL),
-            gemini_response(api.DICT_SENTINEL),
-        ]
-        with patch.dict(os.environ, {
-            "OPENROUTER_API_KEY": "or-test",
-            "GEMINI_API_KEY": "gemini-test",
-        }):
-            response = self.post()
-
+        post.side_effect = [openrouter_response(api.DICT_SENTINEL), gemini_response(api.DICT_SENTINEL)]
+        response = self.post_all()
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json(), {
             "text": api.DICT_SENTINEL,
@@ -208,42 +211,27 @@ class DictFallbackTest(unittest.TestCase):
     def test_near_sentinel_is_canonicalized_and_does_not_short_circuit(self, post):
         post.side_effect = [
             openrouter_response("Sorry, this model cannot handle this language"),
-            openrouter_response("cat"),
+            gemini_response("cat"),
         ]
-        with patch.dict(os.environ, {
-            "OPENROUTER_API_KEY": "or-test",
-            "GEMINI_API_KEY": "gemini-test",
-        }):
-            response = self.post()
-        self.assertEqual(response.get_json(), {"text": "cat", "found": True})
+        self.assertEqual(self.post_all().get_json(), {"text": "cat", "found": True})
         self.assertEqual(post.call_count, 2)
 
     @patch("app.requests.post")
     def test_padded_or_multiline_output_falls_through(self, post):
         post.side_effect = [
             openrouter_response("one, two, three, four, five"),
-            openrouter_response("cat"),
+            gemini_response("cat"),
         ]
-        with patch.dict(os.environ, {
-            "OPENROUTER_API_KEY": "or-test",
-            "GEMINI_API_KEY": "gemini-test",
-        }):
-            response = self.post()
-        self.assertEqual(response.get_json(), {"text": "cat", "found": True})
+        self.assertEqual(self.post_all().get_json(), {"text": "cat", "found": True})
         self.assertEqual(post.call_count, 2)
 
     @patch("app.requests.post")
     def test_truncated_output_falls_through(self, post):
         post.side_effect = [
             openrouter_response("cat, feline, domestic ca", finish_reason="length"),
-            openrouter_response("cat"),
+            gemini_response("cat"),
         ]
-        with patch.dict(os.environ, {
-            "OPENROUTER_API_KEY": "or-test",
-            "GEMINI_API_KEY": "gemini-test",
-        }):
-            response = self.post()
-        self.assertEqual(response.get_json(), {"text": "cat", "found": True})
+        self.assertEqual(self.post_all().get_json(), {"text": "cat", "found": True})
         self.assertEqual(post.call_count, 2)
 
     @patch("app.requests.post")

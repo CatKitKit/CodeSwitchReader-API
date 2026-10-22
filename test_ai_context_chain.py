@@ -395,11 +395,12 @@ class AiContextChainTest(unittest.TestCase):
             self.assertIn("gemini-3.5-flash-lite", post.call_args_list[1].args[0])
 
     @patch.object(api.requests, "post")
-    def test_unmarked_client_error_is_not_retried(self, post):
+    def test_unmarked_client_error_moves_on_instead_of_stopping(self, post):
+        # A rejected Google key (400/401/403) tries 3.5, then the other companies (none here).
         post.return_value = FakeResponse(400, {"error": {"code": 400}})
         response = self.post_unmarked()
-        self.assertEqual(post.call_count, 1)
-        self.assertEqual(response.get_json(), {"error": {"code": 400}})
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual((response.status_code, response.get_json()), (502, {"error": "Upstream error"}))
 
     @patch.object(api.requests, "post")
     def test_unmarked_both_models_failing_without_backup_key_is_one_502(self, post):

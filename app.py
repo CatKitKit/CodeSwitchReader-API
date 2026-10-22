@@ -93,17 +93,21 @@ CONTEXT_PROVIDER_TIMEOUT_SECS = 15
 CONTEXT_CHAIN_BUDGET_SECS = 36
 CONTEXT_MIN_ATTEMPT_SECS = 4
 CONTEXT_LUNA_MAX_TOKENS = 2000
-# Explain bake-off (Kit, 2026-10-21): Luna is cheapest, fast, and plain, but slipped in
-# Georgian, Kazakh, Amharic, Bengali and Tamil, so those and their close relatives ask
-# Gemini 3.8 first; Cantonese is Gemini-first everywhere (Kit, 2026-10-16). Matched on
-# the tapped text's voice code OR the explanation language the learner reads.
-CONTEXT_GEMINI_FIRST_CODES = frozenset({
+# ONE lineup for every text route (Kit, 2026-10-21): Luna -> Gemini 3.8/3.5 -> Gemma, or
+# Gemini first for these languages. Bake-offs (~/bakeoff/explain-luna-2026-10-21,
+# gemma-rare-2026-10-21): Luna is cheapest and plain but slipped in Georgian, Kazakh,
+# Amharic, Bengali and Tamil (these + close relatives); Cantonese is Gemini-first (Kit,
+# 2026-10-16). Gemma is LAST everywhere: worst in 10/11 languages' translations and it
+# invents dictionary meanings in rare languages instead of refusing.
+GEMINI_FIRST_CODES = frozenset({
     "ka", "kk", "ky", "am", "ti", "bn", "as", "ta", "te", "kn", "ml", "si", "yue",
 })
-CONTEXT_GEMINI_FIRST_NAMES = frozenset({
+GEMINI_FIRST_NAMES = frozenset({
     "georgian", "kazakh", "kyrgyz", "amharic", "tigrinya", "bengali", "bangla",
     "assamese", "tamil", "telugu", "kannada", "malayalam", "sinhala", "cantonese",
 })
+# mobile.js studioTranslatePiece's wording; translations name only their target.
+_TRANSLATE_TARGET_RE = re.compile(r"Translate the following text into ([^\n]+?) so that the user")
 # The phone always writes both phrases (mobile.js triggerAiModal).
 _CONTEXT_SOURCE_RE = re.compile(r"\(Source Language: ([A-Za-z0-9_-]+)\)")
 _CONTEXT_TARGET_RE = re.compile(r"Provide all explanations and translations in ([^.\n]+)\.")
@@ -579,6 +583,35 @@ def _openrouter_dict_lookup(api_key, provider, model, system, prompt):
     return _normalized_dict_text(content)
 
 
+def _luna_dict_lookup(api_key, system, prompt):
+    response = requests.post(
+        OPENAI_CHAT_URL,
+        headers={"Authorization": f"Bearer {api_key}"},
+        json={
+            "model": OPENAI_LUNA_MODEL,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+            "reasoning_effort": OPENAI_LUNA_REASONING_EFFORT,
+            # Reasoning tokens count here too; the gloss itself is a few words.
+            "max_completion_tokens": 600,
+            "stream": False,
+        },
+        timeout=(3.05, 8),
+    )
+    if response.status_code != 200:
+        app.logger.warning("dict-fallback provider=luna status=%s", response.status_code)
+        return None
+    data = response.json()
+    choices = data.get("choices") if isinstance(data, dict) else None
+    choice = choices[0] if choices else {}
+    if choice.get("finish_reason") != "stop":
+        return None
+    content = choice.get("message", {}).get("content")
+    return _normalized_dict_text(content)
+
+
 def _is_vertex_key(api_key):
     return isinstance(api_key, str) and api_key.strip().startswith("AQ.")
 
@@ -658,17 +691,23 @@ def _context_request_timeout(total=CONTEXT_PROVIDER_TIMEOUT_SECS):
     return TimeoutSauce(total=total, connect=3.05)
 
 
+def _is_gemini_first_language(value):
+    """A GEMINI_FIRST language given as a name ("Bangla") or a code ("ka-GE", "zh-HK")."""
+    if not isinstance(value, str):
+        return False
+    value = value.strip().lower()
+    if value in GEMINI_FIRST_NAMES:
+        return True
+    parts = value.replace("_", "-").split("-")
+    # Android may name a Cantonese voice zh-HK / zh-MO rather than yue.
+    return parts[0] in GEMINI_FIRST_CODES or (parts[0] == "zh" and ("hk" in parts[1:] or "mo" in parts[1:]))
+
+
 def _context_gemini_first(prompt):
-    match = _CONTEXT_SOURCE_RE.search(prompt)
-    if match:
-        parts = match.group(1).lower().replace("_", "-").split("-")
-        if parts[0] in CONTEXT_GEMINI_FIRST_CODES:
-            return True
-        # Android may name a Cantonese voice zh-HK / zh-MO rather than yue.
-        if parts[0] == "zh" and ("hk" in parts[1:] or "mo" in parts[1:]):
-            return True
-    match = _CONTEXT_TARGET_RE.search(prompt)
-    return bool(match and match.group(1).strip().lower() in CONTEXT_GEMINI_FIRST_NAMES)
+    source = _CONTEXT_SOURCE_RE.search(prompt)
+    target = _CONTEXT_TARGET_RE.search(prompt)
+    return bool((source and _is_gemini_first_language(source.group(1)))
+                or (target and _is_gemini_first_language(target.group(1))))
 
 
 def _context_contract_json(raw_text):
@@ -937,12 +976,9 @@ def _ai_context_explanation(payload):
     return jsonify({"error": "AI context unavailable"}), 502
 
 
-def _gemini_retryable(status):
-    return status in (404, 429) or status >= 500
-
-
 def _gemini_chain(api_key, payload):
-    """Gemini 3.8 then 3.5. A response is final; None means every model was busy/down."""
+    """Gemini 3.8 then 3.5. An answer (or a safety block) is final; None means neither
+    model answered, so the caller moves on to another company."""
     gemini_payload = _gemini_payload(api_key, payload)
     for model in AI_PROXY_MODELS:
         url = _gemini_url(api_key, model)
@@ -959,13 +995,15 @@ def _gemini_chain(api_key, payload):
         except requests.RequestException:
             app.logger.warning("ai-proxy model=%s request failed", model)
             continue
-        # 404 too: a retired model id should not take every Studio down with it.
-        if _gemini_retryable(response.status_code):
-            app.logger.warning("ai-proxy model=%s status=%s; trying next", model, response.status_code)
+        # Every non-200 moves on: 404 = a retired model id, and 400/401/403 = a rejected
+        # Google key, which must not take Studios down while Luna and Gemma still answer
+        # (Kit, 2026-10-21). Logged as an error so a key problem is still seen.
+        if response.status_code != 200:
+            log = app.logger.error if response.status_code in (400, 401, 403) else app.logger.warning
+            log("ai-proxy model=%s status=%s; trying next", model, response.status_code)
             continue
-        # Pass Gemini's JSON through with a 200 like before — mobile.js checks
-        # data.candidates and has its own error UX. A safety block passes through too:
-        # never route around it to another model.
+        # Pass Gemini's JSON through — mobile.js checks data.candidates and has its own
+        # error UX. A safety block (a 200) passes through too: never route around it.
         try:
             return jsonify(response.json())
         except ValueError:
@@ -1018,12 +1056,49 @@ def _chat_messages(payload):
 
 
 def _is_cantonese_payload(payload):
-    """Cantonese stays on Gemini 3.5 Flash-Lite first (Kit, 2026-10-16). Every Cantonese
-    Studio, translation, and lesson prompt in mobile.js appends cantoneseRegisterRule()."""
+    """Every Cantonese Studio, translation, and lesson prompt in mobile.js appends
+    cantoneseRegisterRule()."""
     for content in payload.get("contents") or []:
         if "SPOKEN Cantonese (yue)" in _payload_text(content):
             return True
     return False
+
+
+def _payload_gemini_first(payload):
+    """Cantonese anywhere, or a translation INTO a GEMINI_FIRST language. Writing prompts
+    name their language in many ways, so only these two are read."""
+    if _is_cantonese_payload(payload):
+        return True
+    for content in payload.get("contents") or []:
+        match = _TRANSLATE_TARGET_RE.search(_payload_text(content))
+        if match and _is_gemini_first_language(match.group(1)):
+            return True
+    return False
+
+
+def _text_chain(payload, gemini_first):
+    """The one lineup: Luna -> Gemini 3.8/3.5 -> Gemma, or Gemini first. A provider without
+    a key is skipped; a content block from any of them is final."""
+    openai_key = os.environ.get("OPENAI_API_KEY", "")
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
+
+    def luna():
+        answer = _openai_luna(openai_key, payload)
+        return jsonify(answer) if answer else None
+
+    def gemini():
+        return _gemini_chain(gemini_key, payload) if gemini_key else None
+
+    def gemma():
+        answer = _openrouter_backup(openrouter_key, payload)
+        return jsonify(answer) if answer else None
+
+    for step in ((gemini, luna, gemma) if gemini_first else (luna, gemini, gemma)):
+        answer = step()
+        if answer is not None:
+            return answer
+    return jsonify({"error": "Upstream error"}), 502
 
 
 def _openai_luna(api_key, payload):
@@ -1163,17 +1238,7 @@ def _ai_translation(payload):
     openai_key = os.environ.get("OPENAI_API_KEY", "")
     if not openrouter_key and not gemini_key and not openai_key:
         return jsonify({"error": "Server not configured"}), 503
-    backup = _openrouter_backup(openrouter_key, plain)
-    if backup:
-        return jsonify(backup)
-    if gemini_key:
-        answer = _gemini_chain(gemini_key, plain)
-        if answer is not None:
-            return answer
-    luna = _openai_luna(openai_key, plain)
-    if luna:
-        return jsonify(luna)
-    return jsonify({"error": "Upstream error"}), 502
+    return _text_chain(plain, _payload_gemini_first(plain))
 
 
 # Initialize the IPA generator for Russian and Arabic
@@ -1262,31 +1327,11 @@ def ai_proxy():
         gemini_key = os.environ.get("GEMINI_API_KEY", "")
         if not openai_key and not gemini_key and not openrouter_key:
             return jsonify({"error": "Server not configured"}), 503
-        if openai_key and not _is_cantonese_payload(payload):
-            if not _valid_text_payload(payload):
-                return jsonify({"error": "Bad request"}), 400
-            luna = _openai_luna(openai_key, payload)
-            if luna:
-                return jsonify(luna)
-            backup = _openrouter_backup(openrouter_key, payload)
-            if backup:
-                return jsonify(backup)
-            if gemini_key:
-                answer = _gemini_chain(gemini_key, payload)
-                if answer is not None:
-                    return answer
-            return jsonify({"error": "Upstream error"}), 502
-        if gemini_key:
-            answer = _gemini_chain(gemini_key, payload)
-            if answer is not None:
-                return answer
-        luna = _openai_luna(openai_key, payload)
-        if luna:
-            return jsonify(luna)
-        backup = _openrouter_backup(openrouter_key, payload)
-        if backup:
-            return jsonify(backup)
-        return jsonify({"error": "Upstream error"}), 502
+        gemini_first = _payload_gemini_first(payload)
+        # Text goes somewhere other than Google first only when Luna leads.
+        if openai_key and not gemini_first and not _valid_text_payload(payload):
+            return jsonify({"error": "Bad request"}), 400
+        return _text_chain(payload, gemini_first)
     except Exception:
         app.logger.exception("ai-proxy failure")
         return jsonify({"error": "Upstream error"}), 502
@@ -1376,47 +1421,44 @@ def dict_fallback():
 
     openrouter_key = os.environ.get('OPENROUTER_API_KEY', '')
     gemini_key = os.environ.get('GEMINI_API_KEY', '')
-    if not openrouter_key and not gemini_key:
+    openai_key = os.environ.get('OPENAI_API_KEY', '')
+    if not openrouter_key and not gemini_key and not openai_key:
         return jsonify({"error": "Server not configured"}), 503
 
-    saw_sentinel = False
-    if openrouter_key:
-        for provider, model in DICT_OPENROUTER_CANDIDATES:
-            try:
-                text = _openrouter_dict_lookup(
-                    openrouter_key, provider, model, system, prompt
-                )
-            except requests.Timeout:
-                app.logger.warning("dict-fallback provider=%s timeout", provider)
-                continue
-            except requests.RequestException:
-                app.logger.warning("dict-fallback provider=%s request failed", provider)
-                continue
-            except Exception:
-                # Never log the payload: it contains the user's tapped word.
-                app.logger.exception("dict-fallback provider=%s failure", provider)
-                continue
-            if text == DICT_SENTINEL:
-                saw_sentinel = True
-                continue
-            if text:
-                return jsonify({"text": text, "found": True})
+    # The one lineup (GEMINI_FIRST_*): the Gemmas answer in half a second but invent
+    # meanings for rare-language words instead of refusing, so they only back up.
+    luna = [("luna", lambda: _luna_dict_lookup(openai_key, system, prompt))] if openai_key else []
+    gemini = [("gemini", lambda: _gemini_dict_lookup(gemini_key, system, prompt))] if gemini_key else []
+    gemmas = [
+        (provider, lambda provider=provider, model=model: _openrouter_dict_lookup(
+            openrouter_key, provider, model, system, prompt))
+        for provider, model in DICT_OPENROUTER_CANDIDATES
+    ] if openrouter_key else []
+    source, target = fields[0], fields[1]
+    gemini_first = _is_gemini_first_language(source) or _is_gemini_first_language(target)
+    chain = gemini + luna + gemmas if gemini_first else luna + gemini + gemmas
 
-    if gemini_key:
+    saw_sentinel = False
+    for provider, lookup in chain:
+        if saw_sentinel and provider in dict(DICT_OPENROUTER_CANDIDATES):
+            # Luna or Gemini honestly refused: never let a Gemma guess over that.
+            break
         try:
-            text = _gemini_dict_lookup(gemini_key, system, prompt)
+            text = lookup()
         except requests.Timeout:
-            app.logger.warning("dict-fallback provider=gemini timeout")
-            text = None
+            app.logger.warning("dict-fallback provider=%s timeout", provider)
+            continue
         except requests.RequestException:
-            app.logger.warning("dict-fallback provider=gemini request failed")
-            text = None
+            app.logger.warning("dict-fallback provider=%s request failed", provider)
+            continue
         except Exception:
-            app.logger.exception("dict-fallback provider=gemini failure")
-            text = None
+            # Never log the payload: it contains the user's tapped word.
+            app.logger.exception("dict-fallback provider=%s failure", provider)
+            continue
         if text == DICT_SENTINEL:
             saw_sentinel = True
-        elif text:
+            continue
+        if text:
             return jsonify({"text": text, "found": True})
 
     if saw_sentinel:

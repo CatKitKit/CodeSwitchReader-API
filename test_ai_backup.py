@@ -47,7 +47,7 @@ class AiBackupTest(unittest.TestCase):
         self.assertEqual(data["modelVersion"], "gpt-6-luna")
 
     @patch.object(api.requests, "post")
-    def test_luna_first_when_openai_key_is_set_falling_back_to_gemma_then_gemini(self, post):
+    def test_luna_first_then_gemini_then_gemma_last(self, post):
         all_keys = {**KEYS, "OPENAI_API_KEY": "oa-test"}
         post.side_effect = [openrouter_response("luna story")]
         response = self.post(STORY, env=all_keys)
@@ -59,24 +59,25 @@ class AiBackupTest(unittest.TestCase):
         self.assertEqual(body["reasoning_effort"], "low")
         self.assertEqual(body["max_completion_tokens"], 8192)
 
-        # Luna fails -> Gemma on ModelRun answers
+        # Luna fails -> Gemini 3.8 directly on Google answers
         post.reset_mock()
-        post.side_effect = [FakeResponse(503, {}), openrouter_response("gemma fallback")]
-        response = self.post(STORY, env=all_keys)
-        self.assert_gemma_answer(response, "gemma fallback")
-        self.assertEqual(post.call_count, 2)
-
-        # Luna and Gemma both fail -> Gemini 3.8 directly on Google answers
-        post.reset_mock()
-        post.side_effect = [FakeResponse(503, {}), FakeResponse(503, {}), FakeResponse(200, GEMINI_OK)]
+        post.side_effect = [FakeResponse(503, {}), FakeResponse(200, GEMINI_OK)]
         response = self.post(STORY, env=all_keys)
         self.assertEqual(response.get_json(), GEMINI_OK)
-        self.assertEqual(post.call_count, 3)
-        self.assertIn("gemini-3.8-flash", post.call_args_list[2].args[0])
+        self.assertEqual(post.call_count, 2)
+        self.assertIn("gemini-3.8-flash", post.call_args_list[1].args[0])
         self.assertEqual(
-            post.call_args_list[2].kwargs["json"]["generationConfig"]["thinkingConfig"],
+            post.call_args_list[1].kwargs["json"]["generationConfig"]["thinkingConfig"],
             {"thinkingLevel": "low"},
         )
+
+        # Luna, Gemini 3.8 and 3.5 all fail -> Gemma on ModelRun, last
+        post.reset_mock()
+        post.side_effect = [FakeResponse(503, {}), FakeResponse(503, {}), FakeResponse(503, {}),
+                            openrouter_response("gemma fallback")]
+        response = self.post(STORY, env=all_keys)
+        self.assert_gemma_answer(response, "gemma fallback")
+        self.assertEqual(post.call_count, 4)
 
     @patch.object(api.requests, "post")
     def test_cantonese_stays_on_gemini_first_even_with_openai_key(self, post):
@@ -132,13 +133,24 @@ class AiBackupTest(unittest.TestCase):
 
     @patch.object(api.requests, "post")
     def test_gemini_answers_and_blocks_never_reach_the_backup(self, post):
-        for gemini in (FakeResponse(200, GEMINI_OK), FakeResponse(200, {"promptFeedback": {"blockReason": "SAFETY"}}),
-                       FakeResponse(400, {"error": {"code": 400}})):
+        for gemini in (FakeResponse(200, GEMINI_OK), FakeResponse(200, {"promptFeedback": {"blockReason": "SAFETY"}})):
             post.reset_mock()
             post.side_effect = [gemini]
             response = self.post(STORY)
             self.assertEqual(post.call_count, 1)
             self.assertEqual(response.get_json(), gemini.json())
+
+    @patch.object(api.requests, "post")
+    def test_a_rejected_google_key_moves_on_to_another_company(self, post):
+        # Kit, 2026-10-21: an expired or unpaid Google key must not stop Studios (or all
+        # of Cantonese) while Luna and Gemma still answer.
+        for status in (400, 401, 403):
+            post.reset_mock()
+            post.side_effect = [FakeResponse(status, {"error": {"code": status}}),
+                                FakeResponse(status, {"error": {"code": status}}),
+                                openrouter_response("gemma story")]
+            self.assert_gemma_answer(self.post(STORY), "gemma story")
+            self.assertEqual(post.call_count, 3)
 
     @patch.object(api.requests, "post")
     def test_json_requests_skip_json_mode_and_need_an_object(self, post):
@@ -159,19 +171,41 @@ class AiBackupTest(unittest.TestCase):
             self.assertEqual((response.status_code, response.get_json()), (502, {"error": "Upstream error"}))
 
     @patch.object(api.requests, "post")
-    def test_translations_go_to_gemma_first_without_the_marker(self, post):
+    def test_translations_follow_the_one_lineup_luna_first(self, post):
+        all_keys = {**KEYS, "OPENAI_API_KEY": "oa-test"}
         post.side_effect = [openrouter_response("traducción")]
-        self.assert_gemma_answer(self.post(TRANSLATION), "traducción")
+        self.assert_luna_answer(self.post(TRANSLATION, env=all_keys), "traducción")
         self.assertEqual(post.call_count, 1)
+        self.assertNotIn("purpose", post.call_args.kwargs["json"])
 
     @patch.object(api.requests, "post")
     def test_translation_falls_to_gemini_without_the_marker(self, post):
+        all_keys = {**KEYS, "OPENAI_API_KEY": "oa-test"}
         post.side_effect = [FakeResponse(503, {}), FakeResponse(200, GEMINI_OK)]
-        response = self.post(TRANSLATION)
+        response = self.post(TRANSLATION, env=all_keys)
         self.assertEqual(response.get_json(), GEMINI_OK)
         gemini = post.call_args_list[1]
         self.assertIn("gemini-3.8-flash", gemini.args[0])
         self.assertNotIn("purpose", gemini.kwargs["json"])
+
+    @patch.object(api.requests, "post")
+    def test_translations_into_harder_languages_ask_gemini_first(self, post):
+        all_keys = {**KEYS, "OPENAI_API_KEY": "oa-test"}
+        for target in ("Georgian", "Bangla", "Tamil"):
+            post.reset_mock()
+            post.side_effect = [FakeResponse(200, GEMINI_OK)]
+            text = f"You are a professional translator. Translate the following text into {target} so that the user can match"
+            payload = {"contents": [{"parts": [{"text": text}]}],
+                       "systemInstruction": STORY["systemInstruction"], "purpose": "translation"}
+            self.assertEqual(self.post(payload, env=all_keys).get_json(), GEMINI_OK)
+            self.assertIn("gemini-3.8-flash", post.call_args_list[0].args[0])
+        # A Spanish translation, or a story that merely mentions Georgian, keeps Luna first.
+        for text in ("Translate the following text into Spanish so that the user can match",
+                     "Write a story about a Georgian chef."):
+            post.reset_mock()
+            post.side_effect = [openrouter_response("luna")]
+            payload = {"contents": [{"parts": [{"text": text}]}], "systemInstruction": STORY["systemInstruction"]}
+            self.assert_luna_answer(self.post(payload, env=all_keys), "luna")
 
     @patch.object(api.requests, "post")
     def test_translation_without_openrouter_key_uses_gemini(self, post):
@@ -200,9 +234,10 @@ class AiBackupTest(unittest.TestCase):
                         FakeResponse(200, {"error": {"code": 400, "metadata": {"error_type": "moderation"}}}),
                         FakeResponse(200, {"choices": [{"error": policy, "finish_reason": "error"}]})):
             post.reset_mock()
-            post.side_effect = [blocked]
+            # Gemma is last now: Gemini 3.8 and 3.5 are down first.
+            post.side_effect = [FakeResponse(503, {}), FakeResponse(503, {}), blocked]
             response = self.post(TRANSLATION)
-            self.assertEqual(post.call_count, 1)
+            self.assertEqual(post.call_count, 3)
             self.assertEqual(response.get_json(), api.BACKUP_BLOCKED)
             self.assertNotIn("candidates", response.get_json())
 
