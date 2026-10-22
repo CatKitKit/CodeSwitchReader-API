@@ -31,6 +31,11 @@ def gemini_response(text):
 
 class DictFallbackTest(unittest.TestCase):
     def setUp(self):
+        # No provider key may leak in from the machine: each test names its own.
+        self.env = patch.dict(os.environ)
+        self.env.start()
+        for name in ("OPENAI_API_KEY", "OPENROUTER_API_KEY", "GEMINI_API_KEY"):
+            os.environ.pop(name, None)
         self.old_app_key = api.APP_KEY
         api.APP_KEY = "test-app-key"
         with api._rate_lock:
@@ -47,6 +52,7 @@ class DictFallbackTest(unittest.TestCase):
 
     def tearDown(self):
         api.APP_KEY = self.old_app_key
+        self.env.stop()
 
     def post(self, payload=None, headers=None):
         return self.client.post(
@@ -190,6 +196,14 @@ class DictFallbackTest(unittest.TestCase):
         post.reset_mock()
         post.side_effect = [openrouter_response(api.DICT_SENTINEL), gemini_response("cat")]
         self.assertEqual(self.post_all().get_json(), {"text": "cat", "found": True})
+
+    @patch("app.requests.post")
+    def test_a_gemma_refusal_still_lets_the_other_gemma_answer(self, post):
+        # Only a Luna/Gemini refusal stops the Gemmas (Sol, 2026-10-22).
+        post.side_effect = [FakeResponse(503, {}), FakeResponse(503, {}),
+                            openrouter_response(api.DICT_SENTINEL), openrouter_response("cat")]
+        self.assertEqual(self.post_all().get_json(), {"text": "cat", "found": True})
+        self.assertEqual(post.call_count, 4)
 
     @patch("app.requests.post")
     def test_timeout_falls_through(self, post):

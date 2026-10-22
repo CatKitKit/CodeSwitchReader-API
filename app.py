@@ -87,10 +87,11 @@ CONTEXT_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 CONTEXT_OPENROUTER_PROVIDER = "coreweave"
 CONTEXT_OPENROUTER_MODEL = "google/gemma-4-31b-it"
 CONTEXT_GEMINI_MODEL = GEMINI_FLASH_LITE_MODEL
-# Each provider gets at most 15 s and the whole chain 36 s: the phone gives up at 40 s,
-# so a third provider that starts later than that would answer nobody.
-CONTEXT_PROVIDER_TIMEOUT_SECS = 15
-CONTEXT_CHAIN_BUDGET_SECS = 36
+# Each provider gets at most 13 s and the whole chain 33 s: the phone gives up at 40 s and
+# a cold start eats some of that. (urllib3's total is per request, not a hard wall: a body
+# trickling in can overrun it, so this keeps a margin rather than promising one.)
+CONTEXT_PROVIDER_TIMEOUT_SECS = 13
+CONTEXT_CHAIN_BUDGET_SECS = 33
 CONTEXT_MIN_ATTEMPT_SECS = 4
 CONTEXT_LUNA_MAX_TOKENS = 2000
 # ONE lineup for every text route (Kit, 2026-10-21): Luna -> Gemini 3.8/3.5 -> Gemma, or
@@ -1438,9 +1439,11 @@ def dict_fallback():
     gemini_first = _is_gemini_first_language(source) or _is_gemini_first_language(target)
     chain = gemini + luna + gemmas if gemini_first else luna + gemini + gemmas
 
-    saw_sentinel = False
+    # A blocked lookup moves on like any failure, as in Explain: the word comes from the
+    # learner's own reading, and a false-positive block on one word should not hide it.
+    saw_sentinel = strong_refused = False
     for provider, lookup in chain:
-        if saw_sentinel and provider in dict(DICT_OPENROUTER_CANDIDATES):
+        if strong_refused and provider not in ("luna", "gemini"):
             # Luna or Gemini honestly refused: never let a Gemma guess over that.
             break
         try:
@@ -1457,6 +1460,7 @@ def dict_fallback():
             continue
         if text == DICT_SENTINEL:
             saw_sentinel = True
+            strong_refused = strong_refused or provider in ("luna", "gemini")
             continue
         if text:
             return jsonify({"text": text, "found": True})

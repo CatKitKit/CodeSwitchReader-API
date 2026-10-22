@@ -49,6 +49,11 @@ def gemini_response(text=VALID_JSON, finish_reason="STOP", thought="private thou
 
 class AiContextChainTest(unittest.TestCase):
     def setUp(self):
+        # No provider key may leak in from the machine: each test names its own.
+        self.env = patch.dict(os.environ)
+        self.env.start()
+        for name in ("OPENAI_API_KEY", "OPENROUTER_API_KEY", "GEMINI_API_KEY"):
+            os.environ.pop(name, None)
         self.old_app_key = api.APP_KEY
         self.old_context_mode = os.environ.get(api.AI_CONTEXT_MODE_ENV)
         os.environ[api.AI_CONTEXT_MODE_ENV] = "openrouter"
@@ -71,6 +76,7 @@ class AiContextChainTest(unittest.TestCase):
             os.environ.pop(api.AI_CONTEXT_MODE_ENV, None)
         else:
             os.environ[api.AI_CONTEXT_MODE_ENV] = self.old_context_mode
+        self.env.stop()
 
     def post(self, payload=None):
         return self.client.post(
@@ -122,7 +128,7 @@ class AiContextChainTest(unittest.TestCase):
         return {**self.payload, "contents": [{"parts": [{"text": prompt}]}]}
 
     @patch("app.requests.post")
-    def test_luna_answers_first_with_low_effort_json_and_a_15_second_cap(self, post):
+    def test_luna_answers_first_with_low_effort_json_and_a_13_second_cap(self, post):
         post.return_value = openrouter_response(VALID_JSON, reasoning="never reaches the client")
         response = self.post_chain()
 
@@ -136,7 +142,7 @@ class AiContextChainTest(unittest.TestCase):
         self.assertEqual(body["reasoning_effort"], "low")
         self.assertEqual(body["messages"], [{"role": "user", "content": self.prompt}])
         self.assertEqual(body["response_format"], {"type": "json_object"})
-        self.assertEqual(call.kwargs["timeout"].total, 15)
+        self.assertEqual(call.kwargs["timeout"].total, 13)
         self.assertEqual(call.kwargs["timeout"].connect_timeout, 3.05)
 
     @patch("app.requests.post")
@@ -203,7 +209,7 @@ class AiContextChainTest(unittest.TestCase):
         self.assertIn("gemini-3.8-flash", gemini.args[0])
         self.assertNotIn("?key=", gemini.args[0])
         self.assertEqual(gemini.kwargs["headers"], {"x-goog-api-key": "gemini-test"})
-        self.assertEqual(gemini.kwargs["timeout"].total, 15)
+        self.assertEqual(gemini.kwargs["timeout"].total, 13)
         self.assertNotIn("purpose", gemini.kwargs["json"])
         self.assertEqual(
             gemini.kwargs["json"]["generationConfig"]["thinkingConfig"],
@@ -305,15 +311,15 @@ class AiContextChainTest(unittest.TestCase):
     @patch("app.time.monotonic")
     @patch("app.requests.post")
     def test_chain_fits_the_phones_40_second_wait(self, post, clock):
-        # Luna times out at 15 s, Gemini at 15 s more: Gemma gets the 6 s left, not 15.
-        clock.side_effect = [0, 0, 15, 30]
+        # Luna times out at 13 s, Gemini at 13 s more: Gemma gets the 7 s left, not 13.
+        clock.side_effect = [0, 0, 13, 26]
         post.side_effect = [api.requests.Timeout("a"), api.requests.Timeout("b"), openrouter_response(VALID_JSON)]
         self.assert_contract(self.post_chain())
-        self.assertEqual([c.kwargs["timeout"].total for c in post.call_args_list], [15, 15, 6])
+        self.assertEqual([c.kwargs["timeout"].total for c in post.call_args_list], [13, 13, 7])
 
         # Less than 4 s left: give up rather than start a call the phone won't wait for.
         post.reset_mock()
-        clock.side_effect = [0, 0, 15, 33]
+        clock.side_effect = [0, 0, 13, 30]
         post.side_effect = [api.requests.Timeout("a"), api.requests.Timeout("b")]
         self.assertEqual(self.post_chain().status_code, 502)
         self.assertEqual(post.call_count, 2)
