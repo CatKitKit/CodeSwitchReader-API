@@ -87,11 +87,31 @@ CONTEXT_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 CONTEXT_OPENROUTER_PROVIDER = "coreweave"
 CONTEXT_OPENROUTER_MODEL = "google/gemma-4-31b-it"
 CONTEXT_GEMINI_MODEL = GEMINI_FLASH_LITE_MODEL
-CONTEXT_PROVIDER_TIMEOUT_SECS = 18
+# Each provider gets at most 15 s and the whole chain 36 s: the phone gives up at 40 s,
+# so a third provider that starts later than that would answer nobody.
+CONTEXT_PROVIDER_TIMEOUT_SECS = 15
+CONTEXT_CHAIN_BUDGET_SECS = 36
+CONTEXT_MIN_ATTEMPT_SECS = 4
+CONTEXT_LUNA_MAX_TOKENS = 2000
+# Explain bake-off (Kit, 2026-10-21): Luna is cheapest, fast, and plain, but slipped in
+# Georgian, Kazakh, Amharic, Bengali and Tamil, so those and their close relatives ask
+# Gemini 3.8 first; Cantonese is Gemini-first everywhere (Kit, 2026-10-16). Matched on
+# the tapped text's voice code OR the explanation language the learner reads.
+CONTEXT_GEMINI_FIRST_CODES = frozenset({
+    "ka", "kk", "ky", "am", "ti", "bn", "as", "ta", "te", "kn", "ml", "si", "yue",
+})
+CONTEXT_GEMINI_FIRST_NAMES = frozenset({
+    "georgian", "kazakh", "kyrgyz", "amharic", "tigrinya", "bengali", "bangla",
+    "assamese", "tamil", "telugu", "kannada", "malayalam", "sinhala", "cantonese",
+})
+# The phone always writes both phrases (mobile.js triggerAiModal).
+_CONTEXT_SOURCE_RE = re.compile(r"\(Source Language: ([A-Za-z0-9_-]+)\)")
+_CONTEXT_TARGET_RE = re.compile(r"Provide all explanations and translations in ([^.\n]+)\.")
 # The phone asks for three; the margin tolerates a model that adds one.
 CONTEXT_MAX_EXAMPLES = 5
-# Ordinary development can avoid OpenRouter charges entirely. Set this Cloud Run
-# variable to "openrouter" for the CoreWeave -> Gemini launch chain.
+# Ordinary development can avoid provider charges entirely. Set this Cloud Run variable
+# to "openrouter" (a historical name) for the three-provider launch chain:
+# Luna -> Gemini 3.8 -> Gemma, or Gemini 3.8 -> Luna -> Gemma for the languages above.
 AI_CONTEXT_MODE_ENV = "AI_CONTEXT_MODE"
 AI_CONTEXT_MODES = {"gemini", "openrouter"}
 AI_CONTEXT_DEFAULT_MODE = "gemini"
@@ -632,10 +652,23 @@ def _context_request_payload(payload):
     return {key: value for key, value in payload.items() if key != "purpose"}
 
 
-def _context_request_timeout():
+def _context_request_timeout(total=CONTEXT_PROVIDER_TIMEOUT_SECS):
     # Timeout carries per-request state inside urllib3; never share one instance across
     # Cloud Run's eight request threads.
-    return TimeoutSauce(total=CONTEXT_PROVIDER_TIMEOUT_SECS, connect=3.05)
+    return TimeoutSauce(total=total, connect=3.05)
+
+
+def _context_gemini_first(prompt):
+    match = _CONTEXT_SOURCE_RE.search(prompt)
+    if match:
+        parts = match.group(1).lower().replace("_", "-").split("-")
+        if parts[0] in CONTEXT_GEMINI_FIRST_CODES:
+            return True
+        # Android may name a Cantonese voice zh-HK / zh-MO rather than yue.
+        if parts[0] == "zh" and ("hk" in parts[1:] or "mo" in parts[1:]):
+            return True
+    match = _CONTEXT_TARGET_RE.search(prompt)
+    return bool(match and match.group(1).strip().lower() in CONTEXT_GEMINI_FIRST_NAMES)
 
 
 def _context_contract_json(raw_text):
@@ -711,17 +744,35 @@ def _context_examples(value):
     return examples[:CONTEXT_MAX_EXAMPLES]
 
 
-def _context_envelope(contract_json):
-    # Keep the Gemini response shape mobile.js already consumes.
+def _context_envelope(contract_json, provider="gemini"):
+    # Keep the Gemini response shape mobile.js already consumes. modelVersion names the
+    # provider that answered, so a live probe can see the routing; the phone ignores it.
     return {
         "candidates": [{
             "content": {"parts": [{"text": contract_json}]},
             "finishReason": "STOP",
-        }]
+        }],
+        "modelVersion": provider,
     }
 
 
-def _openrouter_context_response(api_key, prompt):
+def _luna_context_response(api_key, prompt, timeout):
+    return requests.post(
+        OPENAI_CHAT_URL,
+        headers={"Authorization": f"Bearer {api_key}"},
+        json={
+            "model": OPENAI_LUNA_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "response_format": {"type": "json_object"},
+            "reasoning_effort": OPENAI_LUNA_REASONING_EFFORT,
+            "max_completion_tokens": CONTEXT_LUNA_MAX_TOKENS,
+            "stream": False,
+        },
+        timeout=timeout,
+    )
+
+
+def _openrouter_context_response(api_key, prompt, timeout=None):
     payload = {
         "model": CONTEXT_OPENROUTER_MODEL,
         "messages": [{"role": "user", "content": prompt}],
@@ -740,18 +791,18 @@ def _openrouter_context_response(api_key, prompt):
         CONTEXT_OPENROUTER_URL,
         headers={"Authorization": f"Bearer {api_key}"},
         json=payload,
-        timeout=_context_request_timeout(),
+        timeout=timeout or _context_request_timeout(),
     )
 
 
-def _gemini_context_response(api_key, payload):
+def _gemini_context_response(api_key, payload, timeout=None):
     url = _gemini_url(api_key, CONTEXT_GEMINI_MODEL)
     gemini_payload = _gemini_payload(api_key, payload)
     return requests.post(
         url,
         headers={"x-goog-api-key": api_key},
         json=gemini_payload,
-        timeout=_context_request_timeout(),
+        timeout=timeout or _context_request_timeout(),
     )
 
 
@@ -824,7 +875,7 @@ def _serve_gemini_context(api_key, payload):
 def _ai_context_explanation(payload):
     # The phone owns cancellation/stale UI with AbortController + request ids. This
     # synchronous Flask handler cannot reliably observe that the client disconnected,
-    # so an already-running OpenRouter request may still proceed to Gemini and incur cost;
+    # so an already-running chain may still proceed to the next provider and incur cost;
     # preventing that would require a queued/asynchronous backend architecture.
     gemini_payload = _context_request_payload(payload)
     if gemini_payload is None:
@@ -839,46 +890,51 @@ def _ai_context_explanation(payload):
 
     openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    openai_key = os.environ.get("OPENAI_API_KEY", "")
     if mode == "gemini":
         return _serve_gemini_context(gemini_key, gemini_payload)
 
-    if not openrouter_key:
-        # A missing/invalid primary credential is a configuration error, not a reason
-        # to silently change providers.
+    if not (openrouter_key and gemini_key and openai_key):
+        # A missing credential is a configuration error, not a reason to silently
+        # run a shorter chain.
+        app.logger.error("ai-context chain missing a provider key")
         return jsonify({"error": "Server not configured"}), 503
 
     prompt = gemini_payload["contents"][0]["parts"][0]["text"]
-    should_fallback = False
-    try:
-        response = _openrouter_context_response(openrouter_key, prompt)
-        if response.status_code == 200:
-            contract = _openrouter_context_contract(response)
-            if contract:
-                return jsonify(_context_envelope(contract))
-            should_fallback = True
-            app.logger.warning("ai-context provider=%s unusable response", CONTEXT_OPENROUTER_PROVIDER)
-        elif response.status_code == 429 or response.status_code >= 500:
-            should_fallback = True
-            app.logger.warning(
-                "ai-context provider=%s status=%s", CONTEXT_OPENROUTER_PROVIDER, response.status_code
-            )
-        else:
-            # 400/401/403 and every other client/configuration response surface now.
-            status = response.status_code if 400 <= response.status_code < 500 else 502
-            return jsonify({"error": "AI context provider rejected request"}), status
-    except requests.Timeout:
-        should_fallback = True
-        app.logger.warning("ai-context provider=%s timeout", CONTEXT_OPENROUTER_PROVIDER)
-    except requests.RequestException:
-        app.logger.warning("ai-context provider=%s request failed", CONTEXT_OPENROUTER_PROVIDER)
-        return jsonify({"error": "Upstream error"}), 502
-    except Exception:
-        app.logger.exception("ai-context provider=%s failure", CONTEXT_OPENROUTER_PROVIDER)
-        return jsonify({"error": "Upstream error"}), 502
+    luna = ("luna", lambda t: _luna_context_response(openai_key, prompt, t),
+            _openrouter_context_contract)
+    gemini = ("gemini", lambda t: _gemini_context_response(gemini_key, gemini_payload, t),
+              _gemini_context_contract)
+    gemma = (CONTEXT_OPENROUTER_PROVIDER, lambda t: _openrouter_context_response(openrouter_key, prompt, t),
+             _openrouter_context_contract)
+    chain = (gemini, luna, gemma) if _context_gemini_first(prompt) else (luna, gemini, gemma)
 
-    if not should_fallback:
-        return jsonify({"error": "AI context unavailable"}), 502
-    return _serve_gemini_context(gemini_key, gemini_payload)
+    deadline = time.monotonic() + CONTEXT_CHAIN_BUDGET_SECS
+    for name, send, contract_of in chain:
+        remaining = deadline - time.monotonic()
+        if remaining < CONTEXT_MIN_ATTEMPT_SECS:
+            app.logger.warning("ai-context chain out of time before provider=%s", name)
+            break
+        try:
+            response = send(_context_request_timeout(min(CONTEXT_PROVIDER_TIMEOUT_SECS, remaining)))
+            if response.status_code == 200:
+                contract = contract_of(response)
+                if contract:
+                    return jsonify(_context_envelope(contract, name))
+                app.logger.warning("ai-context provider=%s unusable response", name)
+            elif response.status_code in (404, 429) or response.status_code >= 500:
+                app.logger.warning("ai-context provider=%s status=%s", name, response.status_code)
+            else:
+                # 400/401/403 belong to ONE provider (a revoked key, a renamed parameter):
+                # the other two still answer, so log loudly and move on (Kit, 2026-10-21).
+                app.logger.error("ai-context provider=%s status=%s", name, response.status_code)
+        except requests.Timeout:
+            app.logger.warning("ai-context provider=%s timeout", name)
+        except requests.RequestException:
+            app.logger.warning("ai-context provider=%s request failed", name)
+        except Exception:
+            app.logger.exception("ai-context provider=%s failure", name)
+    return jsonify({"error": "AI context unavailable"}), 502
 
 
 def _gemini_retryable(status):

@@ -112,29 +112,78 @@ class AiContextChainTest(unittest.TestCase):
         self.assertEqual(response.status_code, 503)
         post.assert_not_called()
 
+    KEYS = {"OPENROUTER_API_KEY": "or-test", "GEMINI_API_KEY": "gemini-test", "OPENAI_API_KEY": "oa-test"}
+
+    def post_chain(self, payload=None):
+        with patch.dict(os.environ, self.KEYS):
+            return self.post(payload)
+
+    def payload_for(self, prompt):
+        return {**self.payload, "contents": [{"parts": [{"text": prompt}]}]}
+
     @patch("app.requests.post")
-    def test_openrouter_success_is_strictly_pinned_private_and_gemini_shaped(self, post):
-        post.return_value = openrouter_response(
-            VALID_JSON, reasoning="This must never reach the client"
-        )
-        with patch.dict(os.environ, {
-            "OPENROUTER_API_KEY": "or-test",
-            "GEMINI_API_KEY": "gemini-test",
-        }):
-            response = self.post()
+    def test_luna_answers_first_with_low_effort_json_and_a_15_second_cap(self, post):
+        post.return_value = openrouter_response(VALID_JSON, reasoning="never reaches the client")
+        response = self.post_chain()
 
         self.assert_contract(response)
         self.assertEqual(post.call_count, 1)
         call = post.call_args
+        self.assertEqual(call.args[0], api.OPENAI_CHAT_URL)
+        self.assertEqual(call.kwargs["headers"], {"Authorization": "Bearer oa-test"})
+        body = call.kwargs["json"]
+        self.assertEqual(body["model"], "gpt-6-luna")
+        self.assertEqual(body["reasoning_effort"], "low")
+        self.assertEqual(body["messages"], [{"role": "user", "content": self.prompt}])
+        self.assertEqual(body["response_format"], {"type": "json_object"})
+        self.assertEqual(call.kwargs["timeout"].total, 15)
+        self.assertEqual(call.kwargs["timeout"].connect_timeout, 3.05)
+
+    @patch("app.requests.post")
+    def test_hard_languages_ask_gemini_first_then_luna(self, post):
+        hard = (
+            'clicked on the word/phrase: "x" (Source Language: ka-GE).\nProvide all explanations and translations in English.',
+            'clicked on the word/phrase: "x" (Source Language: kk).\nProvide all explanations and translations in English.',
+            'clicked on the word/phrase: "x" (Source Language: zh-HK).\nProvide all explanations and translations in English.',
+            'clicked on the word/phrase: "x" (Source Language: yue-HK).\nProvide all explanations and translations in English.',
+            # The learner reads the explanation in a hard language.
+            'clicked on the word/phrase: "x" (Source Language: fr-FR).\nProvide all explanations and translations in Bangla.',
+        )
+        for prompt in hard:
+            with self.subTest(prompt=prompt):
+                post.reset_mock()
+                post.side_effect = [FakeResponse(503, {}), openrouter_response(VALID_JSON)]
+                response = self.post_chain(self.payload_for(prompt))
+                self.assert_contract(response)
+                self.assertIn("gemini-3.8-flash", post.call_args_list[0].args[0])
+                self.assertEqual(post.call_args_list[1].args[0], api.OPENAI_CHAT_URL)
+
+    def test_ordinary_and_unknown_languages_are_not_gemini_first(self):
+        for prompt in (
+            'clicked on the word/phrase: "x" (Source Language: sw-KE).\nProvide all explanations and translations in English.',
+            'clicked on the word/phrase: "x" (Source Language: zh-CN).\nProvide all explanations and translations in Mandarin.',
+            'clicked on the word/phrase: "x" (Source Language: Unknown).\nProvide all explanations and translations in English.',
+            self.prompt,
+        ):
+            with self.subTest(prompt=prompt):
+                self.assertFalse(api._context_gemini_first(prompt))
+
+    @patch("app.requests.post")
+    def test_gemma_is_last_and_strictly_pinned_private(self, post):
+        post.side_effect = [FakeResponse(503, {}), FakeResponse(503, {}), openrouter_response(VALID_JSON)]
+        response = self.post_chain()
+
+        self.assert_contract(response)
+        self.assertEqual(response.get_json()["modelVersion"], "coreweave")
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual(post.call_args_list[0].args[0], api.OPENAI_CHAT_URL)
+        self.assertIn("gemini-3.8-flash", post.call_args_list[1].args[0])
+        call = post.call_args_list[2]
         self.assertEqual(call.args[0], api.CONTEXT_OPENROUTER_URL)
-        timeout = call.kwargs["timeout"]
-        self.assertEqual(timeout.total, 18)
-        self.assertEqual(timeout.connect_timeout, 3.05)
         self.assertEqual(call.kwargs["headers"], {"Authorization": "Bearer or-test"})
         body = call.kwargs["json"]
         self.assertEqual(body["model"], "google/gemma-4-31b-it")
         self.assertEqual(body["messages"], [{"role": "user", "content": self.prompt}])
-        self.assertEqual(body["response_format"], {"type": "json_object"})
         self.assertEqual(body["provider"], {
             "only": ["coreweave"],
             "order": ["coreweave"],
@@ -144,13 +193,9 @@ class AiContextChainTest(unittest.TestCase):
         })
 
     @patch("app.requests.post")
-    def test_timeout_gives_gemini_a_fresh_18_second_attempt(self, post):
+    def test_luna_timeout_gives_gemini_a_fresh_attempt(self, post):
         post.side_effect = [api.requests.Timeout("synthetic"), gemini_response()]
-        with patch.dict(os.environ, {
-            "OPENROUTER_API_KEY": "or-test",
-            "GEMINI_API_KEY": "gemini-test",
-        }):
-            response = self.post()
+        response = self.post_chain()
 
         self.assert_contract(response)
         self.assertEqual(post.call_count, 2)
@@ -158,35 +203,26 @@ class AiContextChainTest(unittest.TestCase):
         self.assertIn("gemini-3.8-flash", gemini.args[0])
         self.assertNotIn("?key=", gemini.args[0])
         self.assertEqual(gemini.kwargs["headers"], {"x-goog-api-key": "gemini-test"})
-        timeout = gemini.kwargs["timeout"]
-        self.assertEqual(timeout.total, 18)
-        self.assertEqual(timeout.connect_timeout, 3.05)
+        self.assertEqual(gemini.kwargs["timeout"].total, 15)
         self.assertNotIn("purpose", gemini.kwargs["json"])
         self.assertEqual(
             gemini.kwargs["json"]["generationConfig"]["thinkingConfig"],
             {"thinkingLevel": "low"},
         )
-        self.assertEqual(
-            gemini.kwargs["json"]["contents"][0]["parts"][0]["text"],
-            self.prompt,
-        )
+        self.assertEqual(gemini.kwargs["json"]["contents"][0]["parts"][0]["text"], self.prompt)
 
     @patch("app.requests.post")
-    def test_429_and_5xx_each_fall_through_to_gemini(self, post):
-        for status in (429, 500, 502, 503):
-            with self.subTest(status=status):
+    def test_busy_gone_down_or_unreachable_each_fall_through(self, post):
+        for first in (FakeResponse(429, {}), FakeResponse(404, {}), FakeResponse(500, {}),
+                      FakeResponse(503, {}), api.requests.ConnectionError("synthetic")):
+            with self.subTest(first=first):
                 post.reset_mock()
-                post.side_effect = [FakeResponse(status, {}), gemini_response()]
-                with patch.dict(os.environ, {
-                    "OPENROUTER_API_KEY": "or-test",
-                    "GEMINI_API_KEY": "gemini-test",
-                }):
-                    response = self.post()
-                self.assert_contract(response)
+                post.side_effect = [first, gemini_response()]
+                self.assert_contract(self.post_chain())
                 self.assertEqual(post.call_count, 2)
 
     @patch("app.requests.post")
-    def test_unusable_openrouter_json_shapes_each_fall_through(self, post):
+    def test_unusable_luna_json_shapes_each_fall_through(self, post):
         bad_outputs = (
             "not json",
             '{"translation":"x","explainHtml":"<p>x</p>"}',
@@ -201,13 +237,86 @@ class AiContextChainTest(unittest.TestCase):
             with self.subTest(raw=raw):
                 post.reset_mock()
                 post.side_effect = [openrouter_response(raw), gemini_response()]
-                with patch.dict(os.environ, {
-                    "OPENROUTER_API_KEY": "or-test",
-                    "GEMINI_API_KEY": "gemini-test",
-                }):
-                    response = self.post()
-                self.assert_contract(response)
+                self.assert_contract(self.post_chain())
                 self.assertEqual(post.call_count, 2)
+
+    @patch("app.requests.post")
+    def test_invalid_provider_json_truncation_and_refusal_fall_through(self, post):
+        firsts = (
+            FakeResponse(200, ValueError("synthetic bad JSON envelope")),
+            openrouter_response(VALID_JSON[:-1]),
+            openrouter_response(VALID_JSON, finish_reason="length"),
+            openrouter_response(None, finish_reason="content_filter"),
+        )
+        for first in firsts:
+            with self.subTest(first=first):
+                post.reset_mock()
+                post.side_effect = [first, gemini_response()]
+                self.assert_contract(self.post_chain())
+                self.assertEqual(post.call_count, 2)
+
+    @patch("app.requests.post")
+    def test_inline_thinking_and_extra_tail_brace_are_recovered_safely(self, post):
+        post.return_value = openrouter_response(
+            "<think>private chain of thought</think>\n```json\n" + VALID_JSON + "\n}```"
+        )
+        self.assert_contract(self.post_chain())
+        self.assertEqual(post.call_count, 1)
+
+    @patch("app.requests.post")
+    def test_one_providers_key_or_request_error_moves_on_to_the_next(self, post):
+        for status in (400, 401, 403):
+            with self.subTest(status=status):
+                post.reset_mock()
+                post.side_effect = [FakeResponse(status, {"error": "synthetic"}), gemini_response()]
+                self.assert_contract(self.post_chain())
+                self.assertEqual(post.call_count, 2)
+
+    @patch("app.requests.post")
+    def test_any_missing_key_fails_closed_before_any_call(self, post):
+        for missing in self.KEYS:
+            with self.subTest(missing=missing):
+                env = {k: v for k, v in self.KEYS.items() if k != missing}
+                with patch.dict(os.environ, {**env, "AI_CONTEXT_MODE": "openrouter"}, clear=True):
+                    response = self.post()
+                self.assertEqual(response.status_code, 503)
+                post.assert_not_called()
+
+    @patch("app.requests.post")
+    def test_all_three_failing_returns_one_backend_error(self, post):
+        post.side_effect = [FakeResponse(503, {}), FakeResponse(503, {}), FakeResponse(503, {})]
+        response = self.post_chain()
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.get_json(), {"error": "AI context unavailable"})
+        self.assertEqual(post.call_count, 3)
+
+    @patch("app.requests.post")
+    def test_unusable_answers_are_never_returned_to_the_phone(self, post):
+        post.side_effect = [
+            FakeResponse(500, {}),
+            gemini_response('{"translation":"x","explainHtml":"<p>x</p>"}'),
+            openrouter_response("not json"),
+        ]
+        response = self.post_chain()
+        self.assertEqual(response.status_code, 502)
+        self.assertNotIn("candidates", response.get_json())
+        self.assertEqual(post.call_count, 3)
+
+    @patch("app.time.monotonic")
+    @patch("app.requests.post")
+    def test_chain_fits_the_phones_40_second_wait(self, post, clock):
+        # Luna times out at 15 s, Gemini at 15 s more: Gemma gets the 6 s left, not 15.
+        clock.side_effect = [0, 0, 15, 30]
+        post.side_effect = [api.requests.Timeout("a"), api.requests.Timeout("b"), openrouter_response(VALID_JSON)]
+        self.assert_contract(self.post_chain())
+        self.assertEqual([c.kwargs["timeout"].total for c in post.call_args_list], [15, 15, 6])
+
+        # Less than 4 s left: give up rather than start a call the phone won't wait for.
+        post.reset_mock()
+        clock.side_effect = [0, 0, 15, 33]
+        post.side_effect = [api.requests.Timeout("a"), api.requests.Timeout("b")]
+        self.assertEqual(self.post_chain().status_code, 502)
+        self.assertEqual(post.call_count, 2)
 
     def test_example_pairs_are_cleaned_and_replace_the_html_list(self):
         raw = json.dumps({
@@ -233,104 +342,6 @@ class AiContextChainTest(unittest.TestCase):
             with self.subTest(examples=examples):
                 raw = json.dumps({"translation": "x", "explainHtml": "<p>x</p>", "examples": examples})
                 self.assertIsNone(api._context_contract_json(raw))
-
-    @patch("app.requests.post")
-    def test_invalid_provider_json_and_truncation_fall_through(self, post):
-        first_responses = (
-            FakeResponse(200, ValueError("synthetic bad JSON envelope")),
-            openrouter_response(VALID_JSON[:-1]),
-            openrouter_response(VALID_JSON, finish_reason="length"),
-        )
-        for first in first_responses:
-            with self.subTest(first=first):
-                post.reset_mock()
-                post.side_effect = [first, gemini_response()]
-                with patch.dict(os.environ, {
-                    "OPENROUTER_API_KEY": "or-test",
-                    "GEMINI_API_KEY": "gemini-test",
-                }):
-                    response = self.post()
-                self.assert_contract(response)
-                self.assertEqual(post.call_count, 2)
-
-    @patch("app.requests.post")
-    def test_inline_thinking_and_extra_tail_brace_are_recovered_safely(self, post):
-        post.return_value = openrouter_response(
-            "<think>private chain of thought</think>\n```json\n" + VALID_JSON + "\n}```"
-        )
-        with patch.dict(os.environ, {
-            "OPENROUTER_API_KEY": "or-test",
-            "GEMINI_API_KEY": "gemini-test",
-        }):
-            response = self.post()
-        self.assert_contract(response)
-        self.assertEqual(post.call_count, 1)
-
-    @patch("app.requests.post")
-    def test_400_401_403_surface_without_gemini_fallback(self, post):
-        for status in (400, 401, 403):
-            with self.subTest(status=status):
-                post.reset_mock()
-                post.side_effect = None
-                post.return_value = FakeResponse(status, {"error": "synthetic"})
-                with patch.dict(os.environ, {
-                    "OPENROUTER_API_KEY": "or-test",
-                    "GEMINI_API_KEY": "gemini-test",
-                }):
-                    response = self.post()
-                self.assertEqual(response.status_code, status)
-                self.assertEqual(post.call_count, 1)
-
-    @patch("app.requests.post")
-    def test_missing_primary_configuration_does_not_silently_skip_to_gemini(self, post):
-        with patch.dict(os.environ, {
-            "AI_CONTEXT_MODE": "openrouter",
-            "GEMINI_API_KEY": "gemini-test",
-        }, clear=True):
-            response = self.post()
-        self.assertEqual(response.status_code, 503)
-        post.assert_not_called()
-
-    @patch("app.requests.post")
-    def test_both_providers_failing_returns_one_backend_error(self, post):
-        post.side_effect = [FakeResponse(503, {}), FakeResponse(503, {})]
-        with patch.dict(os.environ, {
-            "OPENROUTER_API_KEY": "or-test",
-            "GEMINI_API_KEY": "gemini-test",
-        }):
-            response = self.post()
-        self.assertEqual(response.status_code, 502)
-        self.assertEqual(response.get_json(), {"error": "AI context unavailable"})
-        self.assertEqual(post.call_count, 2)
-
-    @patch("app.requests.post")
-    def test_unusable_gemini_fallback_is_not_returned_to_the_phone(self, post):
-        post.side_effect = [
-            FakeResponse(500, {}),
-            gemini_response('{"translation":"x","explainHtml":"<p>x</p>"}'),
-        ]
-        with patch.dict(os.environ, {
-            "OPENROUTER_API_KEY": "or-test",
-            "GEMINI_API_KEY": "gemini-test",
-        }):
-            response = self.post()
-        self.assertEqual(response.status_code, 502)
-        self.assertNotIn("candidates", response.get_json())
-        self.assertEqual(post.call_count, 2)
-
-    @patch("app.requests.post")
-    def test_gemini_fallback_client_errors_keep_their_status(self, post):
-        for status in (400, 401, 403):
-            with self.subTest(status=status):
-                post.reset_mock()
-                post.side_effect = [FakeResponse(500, {}), FakeResponse(status, {})]
-                with patch.dict(os.environ, {
-                    "OPENROUTER_API_KEY": "or-test",
-                    "GEMINI_API_KEY": "gemini-test",
-                }):
-                    response = self.post()
-                self.assertEqual(response.status_code, status)
-                self.assertEqual(post.call_count, 2)
 
     @patch("app.requests.post")
     def test_bad_or_unknown_purpose_is_rejected_before_upstream(self, post):
