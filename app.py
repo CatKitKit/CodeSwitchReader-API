@@ -177,11 +177,11 @@ SONG_LANGUAGES = frozenset({
 # story" choice never arrives here: its lyrics AI turns it into one of these first.
 SONG_STYLES = {
     "pop", "acoustic", "dance", "lullaby", "folk", "ballad", "rap", "marching",
-    "rock", "heavy metal", "jazz", "country", "reggae",
+    "rock", "heavy metal", "jazz", "country", "reggae", "r&b", "reggaeton",
 }
 SONG_MOODS = {
     "upbeat", "tender", "dramatic", "playful", "wistful", "calm", "determined", "funny",
-    "hopeful", "mysterious",
+    "hopeful", "mysterious", "sultry",
 }
 SONG_MAX_BODY_BYTES = 48 * 1024
 SONG_MAX_AUDIO_BYTES = 12 * 1024 * 1024

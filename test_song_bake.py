@@ -177,6 +177,9 @@ class SongBakeTest(unittest.TestCase):
             response = self.post({**self.payload, "style": "heavy metal", "mood": "hopeful"})
             self.assertEqual(response.status_code, 200)
             self.assertIn("hopeful heavy metal song", send.call_args[1]["json"]["input"])
+            self.assertEqual(self.post({**self.payload, "style": "r&b", "mood": "sultry"}).status_code, 200)
+            self.assertIn("sultry r&b song", send.call_args[1]["json"]["input"])
+            self.assertEqual(self.post({**self.payload, "style": "reggaeton"}).status_code, 200)
         # "Match the story" is the phone's own; it must be resolved before a bake.
         self.assertEqual(self.post({**self.payload, "style": "story"}).status_code, 400)
         self.assertEqual(self.post({**self.payload, "mood": "story"}).status_code, 400)
