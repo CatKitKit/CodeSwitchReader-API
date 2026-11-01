@@ -297,6 +297,32 @@ def _song_rate_limited():
     return None
 
 
+def _song_rate_refund():
+    """Give back the slot a request took when Google blocked it before making a song.
+
+    A blocked prompt costs nothing, and the learner's next move is to change a line and
+    bake again; counting the block would lock them out for ten minutes (Kit, 2026-10-31).
+    """
+    ip = _client_ip()
+    with _song_rate_lock:
+        hits = _song_ip_hits.get(ip)
+        if hits:
+            hits.pop()
+        if _song_daily["day"] == time.strftime('%Y-%m-%d') and _song_daily["count"] > 0:
+            _song_daily["count"] -= 1
+
+
+def _song_upstream_error_code(response):
+    # Google's error code (e.g. "prohibited_content") is safe to log; its message is not
+    # needed and the request itself is user content.
+    try:
+        error = response.json().get("error")
+        code = error.get("code") if isinstance(error, dict) else None
+        return code if isinstance(code, str) else ""
+    except Exception:
+        return ""
+
+
 def _clean_report_field(value, max_chars, required=False):
     if not isinstance(value, str):
         return None
@@ -1371,10 +1397,17 @@ def song_bake():
             timeout=(10, 120),
         )
         if response.status_code >= 400:
+            code = _song_upstream_error_code(response)
             app.logger.warning(
-                "song-bake upstream rejected request status=%s",
-                response.status_code,
+                "song-bake upstream rejected request status=%s code=%s",
+                response.status_code, code,
             )
+            if code == "prohibited_content":
+                # Google's word filter, not an outage: the app shows this under "Your song
+                # did not finish." beside its Back to my lyrics button.
+                _song_rate_refund()
+                return jsonify({"error": "Google's music service blocked a word in these lyrics. "
+                                "Tap Back to my lyrics, change a line, and bake again."}), 422
             return jsonify({"error": "The music service refused this song"}), 502
         audio = _song_audio_from_response(response.json())
         if not audio:

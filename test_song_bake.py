@@ -248,6 +248,36 @@ class SongBakeTest(unittest.TestCase):
         ):
             self.assertEqual(self.post().status_code, 504)
 
+    def test_blocked_lyrics_say_so_and_do_not_use_up_the_limit(self):
+        blocked = StubResponse({"error": {
+            "code": "prohibited_content",
+            "message": "Input blocked: The prompt contains sensitive words.",
+        }}, status_code=400)
+        with patch.object(api, "SONG_RATE_MAX_PER_WINDOW", 1), patch.dict(
+            os.environ, {"LYRIA_API_KEY": "provider-key"}
+        ):
+            with patch.object(api.requests, "post", return_value=blocked):
+                for _ in range(3):
+                    response = self.post()
+                    self.assertEqual(response.status_code, 422)
+                    self.assertIn("blocked a word", response.get_json()["error"])
+                    self.assertIn("Back to my lyrics", response.get_json()["error"])
+            self.assertEqual(api._song_daily["count"], 0)
+            with patch.object(api.requests, "post", return_value=StubResponse(self.upstream)):
+                # The slot the blocks took was given back, so the edited song still bakes.
+                self.assertEqual(self.post().status_code, 200)
+                self.assertEqual(self.post().status_code, 429)
+
+    def test_other_upstream_errors_stay_vague_and_still_count(self):
+        other = StubResponse({"error": {"code": "invalid_argument"}}, status_code=400)
+        with patch.object(api, "SONG_RATE_MAX_PER_WINDOW", 1), patch.dict(
+            os.environ, {"LYRIA_API_KEY": "provider-key"}
+        ), patch.object(api.requests, "post", return_value=other):
+            response = self.post()
+            self.assertEqual(response.status_code, 502)
+            self.assertEqual(response.get_json()["error"], "The music service refused this song")
+            self.assertEqual(self.post().status_code, 429)
+
 
 if __name__ == "__main__":
     unittest.main()
