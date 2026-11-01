@@ -170,6 +170,17 @@ class SongBakeTest(unittest.TestCase):
             self.assertEqual(self.post().status_code, 200)
             self.assertNotIn("lead singer", send.call_args[1]["json"]["input"])
 
+    def test_new_styles_and_moods_bake_and_story_never_does(self):
+        with patch.dict(os.environ, {"LYRIA_API_KEY": "provider-key"}), patch.object(
+            api.requests, "post", return_value=StubResponse(self.upstream)
+        ) as send:
+            response = self.post({**self.payload, "style": "heavy metal", "mood": "hopeful"})
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("hopeful heavy metal song", send.call_args[1]["json"]["input"])
+        # "Match the story" is the phone's own; it must be resolved before a bake.
+        self.assertEqual(self.post({**self.payload, "style": "story"}).status_code, 400)
+        self.assertEqual(self.post({**self.payload, "mood": "story"}).status_code, 400)
+
     def test_unknown_or_malformed_choices_are_refused_not_crashed(self):
         for bad in ({"voice": "baritone"}, {"voice": ["male"]}, {"voice": None},
                     {"style": ["pop"]}, {"mood": {"calm": 1}}):
@@ -267,6 +278,29 @@ class SongBakeTest(unittest.TestCase):
                 # The slot the blocks took was given back, so the edited song still bakes.
                 self.assertEqual(self.post().status_code, 200)
                 self.assertEqual(self.post().status_code, 429)
+
+    def test_a_refund_gives_back_only_its_own_slot(self):
+        # Sol 11/1: A reserves, B reserves, A is blocked. A's refund must not take B's slot.
+        with patch.object(api, "SONG_RATE_MAX_PER_WINDOW", 5):
+            with api.app.test_request_context("/song-bake"), patch.object(api.time, "time", return_value=1000.0):
+                self.assertIsNone(api._song_rate_limited())
+                a_context = api.g.song_reservation
+            with api.app.test_request_context("/song-bake"), patch.object(api.time, "time", return_value=1001.0):
+                self.assertIsNone(api._song_rate_limited())
+            with api.app.test_request_context("/song-bake"):
+                api.g.song_reservation = a_context
+                api._song_rate_refund()
+                api._song_rate_refund()  # a second refund for the same request is a no-op
+        hits = next(iter(api._song_ip_hits.values()))
+        self.assertEqual(hits, [1001.0])
+        self.assertEqual(api._song_daily["count"], 1)
+
+    def test_a_refund_after_midnight_leaves_the_new_day_alone(self):
+        with api.app.test_request_context("/song-bake"):
+            self.assertIsNone(api._song_rate_limited())
+            api.g.song_reservation = api.g.song_reservation[:2] + ("2000-01-01",)
+            api._song_rate_refund()
+        self.assertEqual(api._song_daily["count"], 1)
 
     def test_other_upstream_errors_stay_vague_and_still_count(self):
         other = StubResponse({"error": {"code": "invalid_argument"}}, status_code=400)

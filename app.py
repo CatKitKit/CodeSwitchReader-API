@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 import base64
 import os
@@ -173,11 +173,15 @@ SONG_LANGUAGES = frozenset({
     "Mandarin", "Portuguese", "Romanian", "Russian", "Spanish", "Swedish",
     "Tagalog", "Thai", "Turkish", "Ukrainian", "Vietnamese",
 })
+# Must match the phone's Style/Mood lists (mobile index.html). The phone's "Match the
+# story" choice never arrives here: its lyrics AI turns it into one of these first.
 SONG_STYLES = {
-    "pop", "acoustic", "dance", "lullaby", "folk", "ballad", "rap", "marching"
+    "pop", "acoustic", "dance", "lullaby", "folk", "ballad", "rap", "marching",
+    "rock", "heavy metal", "jazz", "country", "reggae",
 }
 SONG_MOODS = {
-    "upbeat", "tender", "dramatic", "playful", "wistful", "calm", "determined", "funny"
+    "upbeat", "tender", "dramatic", "playful", "wistful", "calm", "determined", "funny",
+    "hopeful", "mysterious",
 }
 SONG_MAX_BODY_BYTES = 48 * 1024
 SONG_MAX_AUDIO_BYTES = 12 * 1024 * 1024
@@ -289,6 +293,8 @@ def _song_rate_limited():
         hits.append(now)
         _song_ip_hits[ip] = hits
         _song_daily["count"] += 1
+        # Exactly this request's slot, so a refund never takes back a neighbour's.
+        g.song_reservation = (ip, now, today)
         if len(_song_ip_hits) > 10000:
             cutoff = now - SONG_RATE_WINDOW_SECS
             for key in list(_song_ip_hits):
@@ -302,13 +308,19 @@ def _song_rate_refund():
 
     A blocked prompt costs nothing, and the learner's next move is to change a line and
     bake again; counting the block would lock them out for ten minutes (Kit, 2026-10-31).
+    Removes this request's own timestamp, and its daily count only on the day it was taken:
+    a later request's slot, or a new day's count after midnight, is never touched (Sol 11/1).
     """
-    ip = _client_ip()
+    reservation = getattr(g, "song_reservation", None)
+    if not reservation:
+        return
+    ip, stamp, day = reservation
+    g.song_reservation = None
     with _song_rate_lock:
         hits = _song_ip_hits.get(ip)
-        if hits:
-            hits.pop()
-        if _song_daily["day"] == time.strftime('%Y-%m-%d') and _song_daily["count"] > 0:
+        if hits and stamp in hits:
+            hits.remove(stamp)
+        if _song_daily["day"] == day and _song_daily["count"] > 0:
             _song_daily["count"] -= 1
 
 
