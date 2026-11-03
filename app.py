@@ -380,7 +380,9 @@ def _plus_subscriptions(rc_user_id):
            f"{requests.utils.quote(rc_user_id, safe='')}/subscriptions")
     params = {"limit": 100}
     found = []
+    complete = False
     for _ in range(5):  # 500 subscriptions is far beyond any real customer
+        _revenuecat_call_allowed()
         try:
             response = requests.get(
                 url, headers={"Authorization": f"Bearer {key}"},
@@ -404,8 +406,13 @@ def _plus_subscriptions(rc_user_id):
                               item.get("environment") == "production"))
         next_page = body.get("next_page")
         if not next_page or not isinstance(next_page, str) or not next_page.startswith("/v2/"):
+            complete = True
             break
-        url, params = "https://api.revenuecat.com" + next_page, None
+        url = "https://api.revenuecat.com" + next_page
+        params = None if "limit=" in next_page else {"limit": 100}
+    if not complete:
+        # Never call a purchase missing just because the history ran past the pages read.
+        raise SongAllowanceUnavailable("RevenueCat history longer than the pages read")
     found.sort(key=lambda sub: not sub[2])  # production before sandbox
     return [(sub_id, in_trial) for sub_id, in_trial, _ in found]
 
@@ -486,24 +493,35 @@ def _song_allowance_refund():
 def _song_lookup_limited():
     """Every Plus check calls RevenueCat, whose customer API is shared and capped (480 a
     minute). Refused songs give their Lyria slot back, so they need a limit of their own
-    that a refusal does NOT refund, per IP and for the whole server (Sol 11/3)."""
+    that a refusal does NOT refund: per IP here, per HTTP call server-wide in
+    _revenuecat_call_allowed (Sol 11/3)."""
     now = time.time()
     ip = _client_ip()
     with _song_rate_lock:
         hits = [s for s in _song_lookup_hits.get(ip, []) if now - s < SONG_RATE_WINDOW_SECS]
-        recent = [s for s in _song_lookup_global if now - s < 60]
-        _song_lookup_global[:] = recent
-        if len(hits) >= SONG_LOOKUP_MAX_PER_WINDOW or len(recent) >= SONG_LOOKUP_GLOBAL_PER_MINUTE:
+        if len(hits) >= SONG_LOOKUP_MAX_PER_WINDOW:
             _song_lookup_hits[ip] = hits
             return jsonify({"error": "Too many songs in a few minutes. Please try again in about 10 minutes."}), 429
         hits.append(now)
         _song_lookup_hits[ip] = hits
-        _song_lookup_global.append(now)
         if len(_song_lookup_hits) > 10000:
             for key in list(_song_lookup_hits):
                 if not any(now - s < SONG_RATE_WINDOW_SECS for s in _song_lookup_hits[key]):
                     del _song_lookup_hits[key]
     return None
+
+
+def _revenuecat_call_allowed():
+    """Charge one RevenueCat HTTP call to the server-wide per-minute budget, or raise
+    (a 503: try again soon). Per call, not per lookup, because one lookup can read several
+    pages. Per Cloud Run instance; the default stays well under RevenueCat's 480."""
+    now = time.time()
+    with _song_rate_lock:
+        recent = [s for s in _song_lookup_global if now - s < 60]
+        _song_lookup_global[:] = recent
+        if len(recent) >= SONG_LOOKUP_GLOBAL_PER_MINUTE:
+            raise SongAllowanceUnavailable("RevenueCat call budget used up")
+        _song_lookup_global.append(now)
 
 
 def _clean_report_field(value, max_chars, required=False):

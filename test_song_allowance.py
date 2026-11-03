@@ -68,7 +68,8 @@ class SongAllowanceTest(unittest.TestCase):
     def setUp(self):
         self.saved = {name: getattr(api, name) for name in (
             "APP_KEY", "SONG_GENERATION_ENABLED", "SONG_PLUS_REQUIRED",
-            "SONG_RATE_MAX_PER_WINDOW", "SONG_LOOKUP_MAX_PER_WINDOW", "_firestore_client")}
+            "SONG_RATE_MAX_PER_WINDOW", "SONG_LOOKUP_MAX_PER_WINDOW",
+            "SONG_LOOKUP_GLOBAL_PER_MINUTE", "_firestore_client")}
         api.APP_KEY = "test-app-key"
         api.SONG_GENERATION_ENABLED = True
         api.SONG_PLUS_REQUIRED = True
@@ -115,11 +116,11 @@ class SongAllowanceTest(unittest.TestCase):
             raise api.requests.ConnectionError("down")
         if self.rc_body is not None:
             return StubResponse(self.rc_body, self.rc_status)
-        page = 1 if "starting_after=" in url else 0
+        page = int(url.rsplit("starting_after=p", 1)[1]) if "starting_after=p" in url else 0
         pages = self.pages or [self.subscriptions]
         body = {"items": pages[page]}
         if page + 1 < len(pages):
-            body["next_page"] = "/v2/projects/proj83fdf9e6/customers/x/subscriptions?starting_after=p1"
+            body["next_page"] = f"/v2/projects/proj83fdf9e6/customers/x/subscriptions?starting_after=p{page + 1}"
         return StubResponse(body, self.rc_status)
 
     def fake_post(self, *args, **kwargs):
@@ -293,6 +294,24 @@ class SongAllowanceTest(unittest.TestCase):
         with patch.object(api, "_firestore", side_effect=RuntimeError("no credentials")):
             self.assertEqual(self.bake().status_code, 503)
         self.assertEqual(self.lyria_calls, 0)
+
+
+    def test_the_server_wide_budget_counts_every_call_not_every_lookup(self):
+        api.SONG_LOOKUP_GLOBAL_PER_MINUTE = 3
+        expired = [{"id": "sub_x", "status": "expired", "gives_access": False}]
+        self.pages = [expired, expired]  # two calls per lookup
+        self.assertEqual(self.bake().status_code, 403)
+        self.assertEqual(self.bake().status_code, 503, "the 4th call is over budget")
+        self.assertEqual(len(self.rc_calls), 3)
+
+    def test_a_history_longer_than_five_pages_is_try_again_not_no_plus(self):
+        old = [{"id": "sub_old", "status": "expired", "gives_access": False}]
+        live = [{"id": "sub_live", "status": "active", "gives_access": True, "environment": "production"}]
+        self.pages = [old] * 5 + [live]
+        response = self.bake()
+        self.assertEqual(response.status_code, 503)
+        self.assertNotIn("plusRequired", response.get_json())
+        self.assertEqual(len(self.rc_calls), 5)
 
 
 if __name__ == "__main__":
