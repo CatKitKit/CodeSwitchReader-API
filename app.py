@@ -165,7 +165,8 @@ SONG_INTERACTIONS_URL = (
 )
 SONG_ALLOWED_PAYLOAD_KEYS = {"lyrics", "targetLanguage", "style", "mood"}
 # Optional, so a phone that predates the choice still bakes (Lyria then picks the singer).
-SONG_OPTIONAL_PAYLOAD_KEYS = {"voice"}
+# rcUserId = the phone's anonymous RevenueCat id, for the Plus song allowance below.
+SONG_OPTIONAL_PAYLOAD_KEYS = {"voice", "rcUserId"}
 SONG_VOICES = {"female": "a female lead singer", "male": "a male lead singer"}
 SONG_LANGUAGES = frozenset({
     "Arabic", "Czech", "Dutch", "English", "French", "German", "Greek",
@@ -191,6 +192,25 @@ SONG_DAILY_MAX = int(os.environ.get("SONG_DAILY_MAX", "25"))
 _song_rate_lock = threading.Lock()
 _song_ip_hits = {}
 _song_daily = {"day": None, "count": 0}
+
+# Plus song allowance (mobile PAYWALL_PLAN.md): songs need a live Plus subscription, and
+# each PURCHASE gets SONG_PLUS_MONTHLY songs a calendar month (UTC), or SONG_PLUS_TRIAL for
+# its whole free week. Counted by RevenueCat's subscription id, never the phone, so a
+# reinstall plus Restore purchases can't reset it. Firestore keeps the counts because Cloud
+# Run forgets everything when it sleeps. OFF until the paid release (SONG_PLUS_REQUIRED=1):
+# until then the phone's own 3-per-install count is the only one.
+SONG_PLUS_REQUIRED = os.environ.get(
+    "SONG_PLUS_REQUIRED", ""
+).strip().lower() in {"1", "true", "yes", "on"}
+SONG_PLUS_MONTHLY = int(os.environ.get("SONG_PLUS_MONTHLY", "5"))
+SONG_PLUS_TRIAL = int(os.environ.get("SONG_PLUS_TRIAL", "2"))
+REVENUECAT_PROJECT_ID = os.environ.get("REVENUECAT_PROJECT_ID", "proj83fdf9e6")
+REVENUECAT_API = "https://api.revenuecat.com/v2"
+SONG_ALLOWANCE_COLLECTION = "song_allowance"
+# RevenueCat anonymous ids look like "$RCAnonymousID:<32 hex>"; allow its plain charset only.
+SONG_RC_USER_RE = re.compile(r"^[A-Za-z0-9$:._-]{1,128}$")
+_firestore_client = None
+_firestore_lock = threading.Lock()
 
 # In-memory rate limiting is deliberate: gunicorn runs 1 worker (8 threads
 # share this process), so no Redis needed at this scale.
@@ -335,6 +355,111 @@ def _song_upstream_error_code(response):
         return ""
 
 
+class SongAllowanceUnavailable(Exception):
+    """RevenueCat or Firestore could not answer; the song is refused, never given free."""
+
+
+def _plus_subscription(rc_user_id):
+    """The customer's subscription that gives Plus now, as (id, in_free_trial), or None.
+
+    gives_access is RevenueCat's own "should have access" flag; the project has one
+    entitlement, so any subscription that gives access is Plus. Sandbox counts too:
+    license testers' purchases are sandbox.
+    """
+    key = os.environ.get("REVENUECAT_SECRET_KEY", "")
+    if not key:
+        raise SongAllowanceUnavailable("no RevenueCat key")
+    url = (f"{REVENUECAT_API}/projects/{REVENUECAT_PROJECT_ID}/customers/"
+           f"{requests.utils.quote(rc_user_id, safe='')}/subscriptions")
+    try:
+        response = requests.get(
+            url, headers={"Authorization": f"Bearer {key}"},
+            params={"limit": 20}, timeout=(5, 10),
+        )
+    except requests.RequestException as error:
+        raise SongAllowanceUnavailable("RevenueCat unreachable") from error
+    if response.status_code == 404:
+        return None  # a phone RevenueCat has never seen has no subscription
+    if response.status_code >= 400:
+        raise SongAllowanceUnavailable(f"RevenueCat status {response.status_code}")
+    try:
+        items = response.json().get("items") or []
+    except ValueError as error:
+        raise SongAllowanceUnavailable("RevenueCat sent bad JSON") from error
+    for item in items:
+        if isinstance(item, dict) and item.get("gives_access") is True and item.get("id"):
+            return str(item["id"]), item.get("status") == "trialing"
+    return None
+
+
+def _firestore():
+    global _firestore_client
+    with _firestore_lock:
+        if _firestore_client is None:
+            from google.cloud import firestore  # only the paid path needs it
+            _firestore_client = firestore.Client()
+        return _firestore_client
+
+
+def _song_allowance_period(in_trial):
+    # The trial is one period of its own; paid months are calendar months in UTC.
+    return "trial" if in_trial else time.strftime("%Y-%m", time.gmtime())
+
+
+def _song_allowance_reserve(subscription_id, in_trial):
+    """Take one song from this purchase's allowance. Returns songs left after it, or
+    None when it is used up. Transactional, so two phones on one purchase can't both
+    take the last song."""
+    from google.cloud import firestore
+    period = _song_allowance_period(in_trial)
+    limit = SONG_PLUS_TRIAL if in_trial else SONG_PLUS_MONTHLY
+    client = _firestore()
+    ref = client.collection(SONG_ALLOWANCE_COLLECTION).document(subscription_id)
+
+    @firestore.transactional
+    def reserve(transaction):
+        snap = ref.get(transaction=transaction)
+        data = snap.to_dict() or {}
+        used = data.get("count", 0) if data.get("period") == period else 0
+        if used >= limit:
+            return None
+        transaction.set(ref, {"period": period, "count": used + 1,
+                              "updated": firestore.SERVER_TIMESTAMP})
+        return limit - used - 1
+
+    try:
+        left = reserve(client.transaction())
+    except Exception as error:
+        raise SongAllowanceUnavailable("Firestore failed") from error
+    if left is not None:
+        g.song_allowance = (subscription_id, period)
+    return left
+
+
+def _song_allowance_refund():
+    """Give back the song this request took, when no song came back. Only within the same
+    period: a refund after the month turned never touches the new month's count."""
+    reservation = getattr(g, "song_allowance", None)
+    if not reservation:
+        return
+    g.song_allowance = None
+    subscription_id, period = reservation
+    try:
+        from google.cloud import firestore
+        client = _firestore()
+        ref = client.collection(SONG_ALLOWANCE_COLLECTION).document(subscription_id)
+
+        @firestore.transactional
+        def refund(transaction):
+            data = ref.get(transaction=transaction).to_dict() or {}
+            if data.get("period") == period and data.get("count", 0) > 0:
+                transaction.update(ref, {"count": data["count"] - 1})
+
+        refund(client.transaction())
+    except Exception:
+        app.logger.exception("song allowance refund failed")
+
+
 def _clean_report_field(value, max_chars, required=False):
     if not isinstance(value, str):
         return None
@@ -381,7 +506,9 @@ def _song_request_fields(payload):
             or payload["style"] not in SONG_STYLES
             or payload["mood"] not in SONG_MOODS
             or ("voice" in payload and not (
-                isinstance(payload["voice"], str) and payload["voice"] in SONG_VOICES))):
+                isinstance(payload["voice"], str) and payload["voice"] in SONG_VOICES))
+            or ("rcUserId" in payload and not (
+                isinstance(payload["rcUserId"], str) and SONG_RC_USER_RE.match(payload["rcUserId"])))):
         return None
     lyrics = _clean_report_field(payload.get("lyrics"), 12000, required=True)
     target_language = _clean_report_field(
@@ -395,6 +522,7 @@ def _song_request_fields(payload):
         "style": payload["style"],
         "mood": payload["mood"],
         "voice": payload.get("voice", ""),
+        "rcUserId": payload.get("rcUserId", ""),
     }
 
 
@@ -1400,7 +1528,49 @@ def song_bake():
     limited = _song_rate_limited()
     if limited:
         return limited
+    songs_left = None
+    if SONG_PLUS_REQUIRED:
+        refused = _song_plus_check(fields["rcUserId"])
+        if isinstance(refused, tuple):
+            _song_rate_refund()  # a refused song costs nothing, so it takes no rate slot
+            return refused
+        songs_left = refused
 
+    delivered = False
+    try:
+        result = _song_bake_upstream(api_key, fields, songs_left)
+        delivered = result[1] == 200
+        return result
+    finally:
+        if not delivered:
+            _song_allowance_refund()
+
+
+def _song_plus_check(rc_user_id):
+    """Songs left after this one, or a (response, status) refusal."""
+    if not rc_user_id:
+        return jsonify({"error": "Songs are part of Plus. Please update the app."}), 403
+    try:
+        subscription = _plus_subscription(rc_user_id)
+        if not subscription:
+            return jsonify({"error": "Songs are part of Plus.", "plusRequired": True}), 403
+        subscription_id, in_trial = subscription
+        left = _song_allowance_reserve(subscription_id, in_trial)
+    except SongAllowanceUnavailable:
+        app.logger.warning("song allowance check unavailable")
+        return jsonify({"error": "We couldn't check your Plus songs just now. Please try again soon."}), 503
+    if left is None:
+        if in_trial:
+            message = (f"You've made all {SONG_PLUS_TRIAL} songs in your free week. "
+                       f"Plus gives you {SONG_PLUS_MONTHLY} a month.")
+        else:
+            message = f"You've made all {SONG_PLUS_MONTHLY} songs for this month. More come next month."
+        return jsonify({"error": message, "songsLeft": 0}), 429
+    return left
+
+
+def _song_bake_upstream(api_key, fields, songs_left):
+    """Lyria's call and its answers. Returns (response, status); 200 only with a song."""
     try:
         response = requests.post(
             SONG_INTERACTIONS_URL,
@@ -1426,12 +1596,15 @@ def song_bake():
             app.logger.warning("song-bake upstream returned no usable MP3")
             return jsonify({"error": "The music service returned no audio"}), 502
         encoded, mime_type, byte_count = audio
-        return jsonify({
+        body = {
             "audioBase64": encoded,
             "mimeType": mime_type,
             "bytes": byte_count,
             "model": SONG_MODEL,
-        })
+        }
+        if songs_left is not None:
+            body["songsLeft"] = songs_left  # the phone's "4 of 5 songs left this month"
+        return jsonify(body), 200
     except requests.Timeout:
         return jsonify({"error": "Song generation timed out"}), 504
     except requests.RequestException:
