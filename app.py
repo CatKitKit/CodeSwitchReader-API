@@ -405,9 +405,11 @@ def _plus_subscriptions(rc_user_id):
                 found.append((str(item["id"]), item.get("status") == "trialing",
                               item.get("environment") == "production"))
         next_page = body.get("next_page")
-        if not next_page or not isinstance(next_page, str) or not next_page.startswith("/v2/"):
+        if not next_page:
             complete = True
             break
+        if not isinstance(next_page, str) or not next_page.startswith("/v2/"):
+            raise SongAllowanceUnavailable("RevenueCat sent an odd next page")
         url = "https://api.revenuecat.com" + next_page
         params = None if "limit=" in next_page else {"limit": 100}
     if not complete:

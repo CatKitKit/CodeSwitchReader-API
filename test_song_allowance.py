@@ -290,6 +290,8 @@ class SongAllowanceTest(unittest.TestCase):
         self.plus()
         self.rc_body = []
         self.assertEqual(self.bake().status_code, 503)
+        self.rc_body = {"items": [], "next_page": {"odd": True}}
+        self.assertEqual(self.bake().status_code, 503, "a malformed next page is not 'no Plus'")
         self.rc_body = None
         with patch.object(api, "_firestore", side_effect=RuntimeError("no credentials")):
             self.assertEqual(self.bake().status_code, 503)
