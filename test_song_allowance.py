@@ -68,15 +68,18 @@ class SongAllowanceTest(unittest.TestCase):
     def setUp(self):
         self.saved = {name: getattr(api, name) for name in (
             "APP_KEY", "SONG_GENERATION_ENABLED", "SONG_PLUS_REQUIRED",
-            "SONG_RATE_MAX_PER_WINDOW", "_firestore_client")}
+            "SONG_RATE_MAX_PER_WINDOW", "SONG_LOOKUP_MAX_PER_WINDOW", "_firestore_client")}
         api.APP_KEY = "test-app-key"
         api.SONG_GENERATION_ENABLED = True
         api.SONG_PLUS_REQUIRED = True
         api.SONG_RATE_MAX_PER_WINDOW = 100  # the IP limit has its own tests
+        api.SONG_LOOKUP_MAX_PER_WINDOW = 100
         api._firestore_client = None
         with api._song_rate_lock:
             api._song_ip_hits.clear()
             api._song_daily.update({"day": None, "count": 0})
+            api._song_lookup_hits.clear()
+            api._song_lookup_global.clear()
         self.store = {}
         firestore = fake_firestore_module(self.store)
         cloud = types.ModuleType("google.cloud")
@@ -92,6 +95,8 @@ class SongAllowanceTest(unittest.TestCase):
         self.client = api.app.test_client()
         self.subscriptions = []        # what RevenueCat says this customer has
         self.rc_status = 200
+        self.rc_body = None
+        self.pages = None
         self.rc_calls = []
         self.lyria_calls = 0
         self.lyria_response = StubResponse({"steps": [{"type": "model_output", "content": [{
@@ -108,7 +113,14 @@ class SongAllowanceTest(unittest.TestCase):
         self.rc_calls.append((url, headers))
         if self.rc_status == "down":
             raise api.requests.ConnectionError("down")
-        return StubResponse({"items": self.subscriptions}, self.rc_status)
+        if self.rc_body is not None:
+            return StubResponse(self.rc_body, self.rc_status)
+        page = 1 if "starting_after=" in url else 0
+        pages = self.pages or [self.subscriptions]
+        body = {"items": pages[page]}
+        if page + 1 < len(pages):
+            body["next_page"] = "/v2/projects/proj83fdf9e6/customers/x/subscriptions?starting_after=p1"
+        return StubResponse(body, self.rc_status)
 
     def fake_post(self, *args, **kwargs):
         self.lyria_calls += 1
@@ -124,8 +136,13 @@ class SongAllowanceTest(unittest.TestCase):
             return self.client.post("/song-bake", json=payload,
                                     headers={"X-App-Key": "test-app-key"})
 
-    def plus(self, status="active", sub_id="sub_1"):
-        self.subscriptions = [{"id": sub_id, "status": status, "gives_access": True}]
+    def plus(self, status="active", sub_id="sub_1", environment="production"):
+        self.subscriptions = [{"id": sub_id, "status": status, "gives_access": True,
+                               "environment": environment}]
+
+    def count(self, sub_id="sub_1", period=None):
+        period = period or api._song_allowance_period(False)
+        return self.store.get(("song_allowance", f"{sub_id}__{period}"), {}).get("count", 0)
 
     def test_switch_off_ignores_the_id_and_never_asks_revenuecat(self):
         api.SONG_PLUS_REQUIRED = False
@@ -206,7 +223,7 @@ class SongAllowanceTest(unittest.TestCase):
         self.assertEqual(self.bake().status_code, 502)
         self.lyria_response = StubResponse({"steps": []})
         self.assertEqual(self.bake().status_code, 502)
-        self.assertEqual(self.store[("song_allowance", "sub_1")]["count"], 0)
+        self.assertEqual(self.count(), 0)
 
     def test_revenuecat_or_firestore_down_refuses_without_charging_anything(self):
         self.plus()
@@ -222,6 +239,58 @@ class SongAllowanceTest(unittest.TestCase):
     def test_no_secret_key_on_the_server_refuses_rather_than_giving_songs_away(self):
         self.plus()
         with patch.dict("os.environ", {"REVENUECAT_SECRET_KEY": ""}):
+            self.assertEqual(self.bake().status_code, 503)
+        self.assertEqual(self.lyria_calls, 0)
+
+
+    def test_a_delayed_request_from_an_old_period_never_resets_the_new_one(self):
+        self.plus()
+        with patch.object(api, "_song_allowance_period", return_value="2026-12"):
+            for _ in range(5):
+                self.bake()
+        with patch.object(api, "_song_allowance_period", return_value="2026-11"):
+            self.bake()  # a November request landing late
+        with patch.object(api, "_song_allowance_period", return_value="2026-12"):
+            self.assertEqual(self.bake().status_code, 429, "December stays used up")
+        self.plus(status="trialing")  # a late "still in the free week" answer
+        self.bake()
+        self.plus(status="active")
+        with patch.object(api, "_song_allowance_period", return_value="2026-12"):
+            self.assertEqual(self.bake().status_code, 429)
+
+    def test_refused_songs_still_use_up_plus_checks(self):
+        api.SONG_LOOKUP_MAX_PER_WINDOW = 3
+        self.subscriptions = []
+        for _ in range(3):
+            self.assertEqual(self.bake().status_code, 403)
+        self.assertEqual(self.bake().status_code, 429)
+        self.assertEqual(len(self.rc_calls), 3, "the fourth never reaches RevenueCat")
+
+    def test_a_used_up_purchase_does_not_hide_another_with_songs_left(self):
+        self.subscriptions = [
+            {"id": "sub_sandbox", "status": "active", "gives_access": True, "environment": "sandbox"},
+            {"id": "sub_prod", "status": "active", "gives_access": True, "environment": "production"},
+        ]
+        for _ in range(5):
+            self.bake()
+        self.assertEqual(self.count("sub_prod"), 5, "production is used first")
+        self.assertEqual(self.bake().status_code, 200)
+        self.assertEqual(self.count("sub_sandbox"), 1)
+
+    def test_every_page_of_purchases_is_read(self):
+        self.pages = [
+            [{"id": "sub_old", "status": "expired", "gives_access": False}],
+            [{"id": "sub_live", "status": "active", "gives_access": True, "environment": "production"}],
+        ]
+        self.assertEqual(self.bake().status_code, 200)
+        self.assertEqual(self.count("sub_live"), 1)
+
+    def test_odd_answers_and_a_broken_database_are_a_503_not_a_crash(self):
+        self.plus()
+        self.rc_body = []
+        self.assertEqual(self.bake().status_code, 503)
+        self.rc_body = None
+        with patch.object(api, "_firestore", side_effect=RuntimeError("no credentials")):
             self.assertEqual(self.bake().status_code, 503)
         self.assertEqual(self.lyria_calls, 0)
 

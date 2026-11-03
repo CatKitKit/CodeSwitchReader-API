@@ -211,6 +211,12 @@ SONG_ALLOWANCE_COLLECTION = "song_allowance"
 SONG_RC_USER_RE = re.compile(r"^[A-Za-z0-9$:._-]{1,128}$")
 _firestore_client = None
 _firestore_lock = threading.Lock()
+# Plus checks per IP per 10 minutes, and for the whole server per minute (RevenueCat's
+# shared customer API allows 480 a minute). Kept even when a song is refused.
+SONG_LOOKUP_MAX_PER_WINDOW = int(os.environ.get("SONG_LOOKUP_MAX_PER_WINDOW", "12"))
+SONG_LOOKUP_GLOBAL_PER_MINUTE = int(os.environ.get("SONG_LOOKUP_GLOBAL_PER_MINUTE", "240"))
+_song_lookup_hits = {}
+_song_lookup_global = []
 
 # In-memory rate limiting is deliberate: gunicorn runs 1 worker (8 threads
 # share this process), so no Redis needed at this scale.
@@ -359,37 +365,49 @@ class SongAllowanceUnavailable(Exception):
     """RevenueCat or Firestore could not answer; the song is refused, never given free."""
 
 
-def _plus_subscription(rc_user_id):
-    """The customer's subscription that gives Plus now, as (id, in_free_trial), or None.
+def _plus_subscriptions(rc_user_id):
+    """Every subscription that gives Plus now, as (id, in_free_trial), production first.
 
     gives_access is RevenueCat's own "should have access" flag; the project has one
     entitlement, so any subscription that gives access is Plus. Sandbox counts too:
-    license testers' purchases are sandbox.
+    license testers' purchases are sandbox. All pages are read, so a long purchase
+    history can't hide the live one (Sol 11/3).
     """
     key = os.environ.get("REVENUECAT_SECRET_KEY", "")
     if not key:
         raise SongAllowanceUnavailable("no RevenueCat key")
     url = (f"{REVENUECAT_API}/projects/{REVENUECAT_PROJECT_ID}/customers/"
            f"{requests.utils.quote(rc_user_id, safe='')}/subscriptions")
-    try:
-        response = requests.get(
-            url, headers={"Authorization": f"Bearer {key}"},
-            params={"limit": 20}, timeout=(5, 10),
-        )
-    except requests.RequestException as error:
-        raise SongAllowanceUnavailable("RevenueCat unreachable") from error
-    if response.status_code == 404:
-        return None  # a phone RevenueCat has never seen has no subscription
-    if response.status_code >= 400:
-        raise SongAllowanceUnavailable(f"RevenueCat status {response.status_code}")
-    try:
-        items = response.json().get("items") or []
-    except ValueError as error:
-        raise SongAllowanceUnavailable("RevenueCat sent bad JSON") from error
-    for item in items:
-        if isinstance(item, dict) and item.get("gives_access") is True and item.get("id"):
-            return str(item["id"]), item.get("status") == "trialing"
-    return None
+    params = {"limit": 100}
+    found = []
+    for _ in range(5):  # 500 subscriptions is far beyond any real customer
+        try:
+            response = requests.get(
+                url, headers={"Authorization": f"Bearer {key}"},
+                params=params, timeout=(5, 10),
+            )
+        except requests.RequestException as error:
+            raise SongAllowanceUnavailable("RevenueCat unreachable") from error
+        if response.status_code == 404:
+            return []  # a phone RevenueCat has never seen has no subscription
+        if response.status_code >= 400:
+            raise SongAllowanceUnavailable(f"RevenueCat status {response.status_code}")
+        try:
+            body = response.json()
+        except ValueError as error:
+            raise SongAllowanceUnavailable("RevenueCat sent bad JSON") from error
+        if not isinstance(body, dict) or not isinstance(body.get("items", []), list):
+            raise SongAllowanceUnavailable("RevenueCat sent an unexpected shape")
+        for item in body.get("items") or []:
+            if isinstance(item, dict) and item.get("gives_access") is True and item.get("id"):
+                found.append((str(item["id"]), item.get("status") == "trialing",
+                              item.get("environment") == "production"))
+        next_page = body.get("next_page")
+        if not next_page or not isinstance(next_page, str) or not next_page.startswith("/v2/"):
+            break
+        url, params = "https://api.revenuecat.com" + next_page, None
+    found.sort(key=lambda sub: not sub[2])  # production before sandbox
+    return [(sub_id, in_trial) for sub_id, in_trial, _ in found]
 
 
 def _firestore():
@@ -406,28 +424,33 @@ def _song_allowance_period(in_trial):
     return "trial" if in_trial else time.strftime("%Y-%m", time.gmtime())
 
 
+def _song_allowance_ref(subscription_id, period):
+    # One counter per purchase AND period: a request delayed across a month change (or a
+    # late "trialing" answer) writes its own period and can never reset another (Sol 11/3).
+    return _firestore().collection(SONG_ALLOWANCE_COLLECTION).document(
+        f"{subscription_id}__{period}")
+
+
 def _song_allowance_reserve(subscription_id, in_trial):
-    """Take one song from this purchase's allowance. Returns songs left after it, or
-    None when it is used up. Transactional, so two phones on one purchase can't both
-    take the last song."""
-    from google.cloud import firestore
+    """Take one song from this purchase's allowance for this period. Returns songs left
+    after it, or None when it is used up. Transactional, so two phones on one purchase
+    can't both take the last song."""
     period = _song_allowance_period(in_trial)
     limit = SONG_PLUS_TRIAL if in_trial else SONG_PLUS_MONTHLY
-    client = _firestore()
-    ref = client.collection(SONG_ALLOWANCE_COLLECTION).document(subscription_id)
-
-    @firestore.transactional
-    def reserve(transaction):
-        snap = ref.get(transaction=transaction)
-        data = snap.to_dict() or {}
-        used = data.get("count", 0) if data.get("period") == period else 0
-        if used >= limit:
-            return None
-        transaction.set(ref, {"period": period, "count": used + 1,
-                              "updated": firestore.SERVER_TIMESTAMP})
-        return limit - used - 1
-
     try:
+        from google.cloud import firestore
+        client = _firestore()
+        ref = _song_allowance_ref(subscription_id, period)
+
+        @firestore.transactional
+        def reserve(transaction):
+            data = ref.get(transaction=transaction).to_dict() or {}
+            used = data.get("count", 0)
+            if used >= limit:
+                return None
+            transaction.set(ref, {"count": used + 1, "updated": firestore.SERVER_TIMESTAMP})
+            return limit - used - 1
+
         left = reserve(client.transaction())
     except Exception as error:
         raise SongAllowanceUnavailable("Firestore failed") from error
@@ -437,8 +460,8 @@ def _song_allowance_reserve(subscription_id, in_trial):
 
 
 def _song_allowance_refund():
-    """Give back the song this request took, when no song came back. Only within the same
-    period: a refund after the month turned never touches the new month's count."""
+    """Give back the song this request took, when no song came back. Best effort: if
+    Firestore fails at this moment the song stays counted (logged), never the reverse."""
     reservation = getattr(g, "song_allowance", None)
     if not reservation:
         return
@@ -447,17 +470,40 @@ def _song_allowance_refund():
     try:
         from google.cloud import firestore
         client = _firestore()
-        ref = client.collection(SONG_ALLOWANCE_COLLECTION).document(subscription_id)
+        ref = _song_allowance_ref(subscription_id, period)
 
         @firestore.transactional
         def refund(transaction):
             data = ref.get(transaction=transaction).to_dict() or {}
-            if data.get("period") == period and data.get("count", 0) > 0:
+            if data.get("count", 0) > 0:
                 transaction.update(ref, {"count": data["count"] - 1})
 
         refund(client.transaction())
     except Exception:
         app.logger.exception("song allowance refund failed")
+
+
+def _song_lookup_limited():
+    """Every Plus check calls RevenueCat, whose customer API is shared and capped (480 a
+    minute). Refused songs give their Lyria slot back, so they need a limit of their own
+    that a refusal does NOT refund, per IP and for the whole server (Sol 11/3)."""
+    now = time.time()
+    ip = _client_ip()
+    with _song_rate_lock:
+        hits = [s for s in _song_lookup_hits.get(ip, []) if now - s < SONG_RATE_WINDOW_SECS]
+        recent = [s for s in _song_lookup_global if now - s < 60]
+        _song_lookup_global[:] = recent
+        if len(hits) >= SONG_LOOKUP_MAX_PER_WINDOW or len(recent) >= SONG_LOOKUP_GLOBAL_PER_MINUTE:
+            _song_lookup_hits[ip] = hits
+            return jsonify({"error": "Too many songs in a few minutes. Please try again in about 10 minutes."}), 429
+        hits.append(now)
+        _song_lookup_hits[ip] = hits
+        _song_lookup_global.append(now)
+        if len(_song_lookup_hits) > 10000:
+            for key in list(_song_lookup_hits):
+                if not any(now - s < SONG_RATE_WINDOW_SECS for s in _song_lookup_hits[key]):
+                    del _song_lookup_hits[key]
+    return None
 
 
 def _clean_report_field(value, max_chars, required=False):
@@ -1550,12 +1596,19 @@ def _song_plus_check(rc_user_id):
     """Songs left after this one, or a (response, status) refusal."""
     if not rc_user_id:
         return jsonify({"error": "Songs are part of Plus. Please update the app."}), 403
+    looked_up = _song_lookup_limited()
+    if looked_up:
+        return looked_up
+    left, in_trial = None, False
     try:
-        subscription = _plus_subscription(rc_user_id)
-        if not subscription:
+        subscriptions = _plus_subscriptions(rc_user_id)
+        if not subscriptions:
             return jsonify({"error": "Songs are part of Plus.", "plusRequired": True}), 403
-        subscription_id, in_trial = subscription
-        left = _song_allowance_reserve(subscription_id, in_trial)
+        # Each live purchase in turn: one used up must not hide another with songs left.
+        for subscription_id, in_trial in subscriptions:
+            left = _song_allowance_reserve(subscription_id, in_trial)
+            if left is not None:
+                break
     except SongAllowanceUnavailable:
         app.logger.warning("song allowance check unavailable")
         return jsonify({"error": "We couldn't check your Plus songs just now. Please try again soon."}), 503
