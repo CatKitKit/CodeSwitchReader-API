@@ -44,6 +44,11 @@ CORS(app, origins=[
 # AI_PROXY_APP_KEY in mobile.js. If unset, /ai-proxy FAILS CLOSED (503) — this
 # makes deploy order safe (env var can land before or after this code).
 APP_KEY = os.environ.get('APP_KEY', '')
+# Paid-update key swap (mobile PAYWALL_PLAN.md §3). APP_KEY_NEXT is accepted beside APP_KEY
+# so the new build works before release day. On release day: APP_KEY = the new key,
+# RETIRED_APP_KEY = the old one (answered 426, "please update", not 401), drop APP_KEY_NEXT.
+APP_KEY_NEXT = os.environ.get('APP_KEY_NEXT', '')
+RETIRED_APP_KEY = os.environ.get('RETIRED_APP_KEY', '')
 
 # Only the payload shapes mobile.js actually sends. Model stays server-side.
 AI_CONTEXT_PURPOSE = "context_explanation"
@@ -236,9 +241,24 @@ def _client_ip():
     return request.remote_addr or 'unknown'
 
 
+def _key_matches(supplied, key):
+    # Bytes, because compare_digest raises on a non-ASCII str (a junk header became a 500).
+    return bool(key) and hmac.compare_digest(supplied.encode('utf-8'), key.encode('utf-8'))
+
+
 def _authorized():
     supplied = request.headers.get('X-App-Key', '')
-    return bool(APP_KEY) and hmac.compare_digest(supplied, APP_KEY)
+    return _key_matches(supplied, APP_KEY) or _key_matches(supplied, APP_KEY_NEXT)
+
+
+def _auth_refusal():
+    """The refusal for a request without a current app key, or None when it has one."""
+    if _authorized():
+        return None
+    if _key_matches(request.headers.get('X-App-Key', ''), RETIRED_APP_KEY):
+        # The app turns a 426 from our origin into "There's a new version… Open Google Play?"
+        return jsonify({"error": "Please update the app"}), 426
+    return jsonify({"error": "Unauthorized"}), 401
 
 
 def _rate_limited():
@@ -1535,8 +1555,9 @@ def ai_proxy():
     # (Auth before rate limit so anonymous floods can't drain the daily budget.)
     if not APP_KEY:
         return jsonify({"error": "Server not configured"}), 503
-    if not _authorized():
-        return jsonify({"error": "Unauthorized"}), 401
+    refused = _auth_refusal()
+    if refused:
+        return refused
     limited = _rate_limited()
     if limited:
         return limited
@@ -1576,8 +1597,9 @@ def song_bake():
     # launch switch, exact payload, and separate cost limit ahead of the Lyria call.
     if not APP_KEY:
         return jsonify({"error": "Server not configured"}), 503
-    if not _authorized():
-        return jsonify({"error": "Unauthorized"}), 401
+    refused = _auth_refusal()
+    if refused:
+        return refused
     if not SONG_GENERATION_ENABLED:
         return jsonify({"error": "Song generation is not enabled"}), 503
     if (request.content_length or 0) > SONG_MAX_BODY_BYTES:
@@ -1698,8 +1720,9 @@ def dict_fallback():
     # Order matches /ai-proxy: config -> auth -> rate -> size -> exact shape.
     if not APP_KEY:
         return jsonify({"error": "Server not configured"}), 503
-    if not _authorized():
-        return jsonify({"error": "Unauthorized"}), 401
+    refused = _auth_refusal()
+    if refused:
+        return refused
     limited = _rate_limited()
     if limited:
         return limited
@@ -1768,8 +1791,9 @@ def report_ai_output():
     # reports cannot consume (or be blocked by) the generation quota.
     if not APP_KEY:
         return jsonify({"error": "Server not configured"}), 503
-    if not _authorized():
-        return jsonify({"error": "Unauthorized"}), 401
+    refused = _auth_refusal()
+    if refused:
+        return refused
     if (request.content_length or 0) > REPORT_MAX_BODY_BYTES:
         return jsonify({"error": "Request too large"}), 413
 
