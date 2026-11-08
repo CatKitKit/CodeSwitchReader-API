@@ -208,6 +208,32 @@ class AiBackupTest(unittest.TestCase):
             self.assert_luna_answer(self.post(payload, env=all_keys), "luna")
 
     @patch.object(api.requests, "post")
+    def test_declared_languages_pick_the_lineup(self, post):
+        # Kit, 2026-11-07: a Tamil lesson's prompt names no language in a form the
+        # wording check reads, so the phone states its languages outright.
+        all_keys = {**KEYS, "OPENAI_API_KEY": "oa-test"}
+        for langs in (["English", "Tamil"], ["ta-IN"], ["zh-HK", "English"], ["Bangla"]):
+            for payload in (STORY, LESSON, TRANSLATION):
+                post.reset_mock()
+                post.side_effect = [FakeResponse(200, GEMINI_OK)]
+                self.assertEqual(self.post(dict(payload, languages=langs), env=all_keys).get_json(), GEMINI_OK)
+                self.assertIn("gemini-3.8-flash", post.call_args_list[0].args[0])
+                # Never forwarded to a provider.
+                self.assertNotIn("languages", post.call_args_list[0].kwargs["json"])
+        for payload in (STORY, TRANSLATION):
+            post.reset_mock()
+            post.side_effect = [openrouter_response("luna")]
+            self.assert_luna_answer(self.post(dict(payload, languages=["English", "Spanish"]), env=all_keys), "luna")
+            self.assertNotIn("languages", str(post.call_args.kwargs["json"]))
+
+    @patch.object(api.requests, "post")
+    def test_declared_languages_shape_is_strict(self, post):
+        for bad in ("Tamil", [], ["a", "b", "c", "d", "e"], [5], [""], ["x" * 41], {"lang": "ta"}, None):
+            payload = dict(STORY, languages=bad)
+            self.assertEqual(self.post(payload).status_code, 400, bad)
+        post.assert_not_called()
+
+    @patch.object(api.requests, "post")
     def test_translation_without_openrouter_key_uses_gemini(self, post):
         post.side_effect = [FakeResponse(200, GEMINI_OK)]
         response = self.post(TRANSLATION, env={"GEMINI_API_KEY": "gemini-test"})

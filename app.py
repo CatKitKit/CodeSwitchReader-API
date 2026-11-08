@@ -53,16 +53,16 @@ RETIRED_APP_KEY = os.environ.get('RETIRED_APP_KEY', '')
 # Only the payload shapes mobile.js actually sends. Model stays server-side.
 AI_CONTEXT_PURPOSE = "context_explanation"
 ALLOWED_PAYLOAD_KEYS = {
-    "contents", "systemInstruction", "generationConfig", "purpose"
+    "contents", "systemInstruction", "generationConfig", "purpose", "languages"
 }
+# Optional "languages": the languages a request writes, reads or explains, as the phone
+# knows them (names or codes). It picks the lineup and is removed before any provider
+# sees the payload. Prompt-wording detection stays as the fallback for older app builds.
+MAX_DECLARED_LANGUAGES = 4
+MAX_DECLARED_LANGUAGE_CHARS = 40
 MAX_BODY_BYTES = 50 * 1024
 
-# AI Context explanations alone use the slower, quality-first provider chain. The
-# phone marks only that request; summaries, Studios, lessons, and translations keep
-# the ordinary Gemini-only /ai-proxy path below.
-# Ordinary /ai-proxy calls try Gemini 3.8 Flash first, then 3.5 Flash-Lite on
-# busy/down errors. Dictionary and context already have OpenRouter in front of
-# Gemini, so they get no second Gemini model (Kit, 2026-10-07 / 2026-10-17).
+# Within the Gemini step, 3.8 Flash is tried first, then 3.5 Flash-Lite on busy/down errors.
 GEMINI_PRIMARY_MODEL = "gemini-3.8-flash"
 GEMINI_FALLBACK_MODEL = "gemini-3.5-flash-lite"
 GEMINI_FLASH_LITE_MODEL = GEMINI_PRIMARY_MODEL
@@ -70,11 +70,7 @@ GEMINI_THINKING_LEVEL = "low"
 AI_PROXY_MODELS = (GEMINI_PRIMARY_MODEL, GEMINI_FALLBACK_MODEL)
 GEMINI_AI_STUDIO_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 GEMINI_VERTEX_BASE = "https://aiplatform.googleapis.com/v1/publishers/google/models"
-# Non-Cantonese Studio/lesson calls go to OpenAI gpt-6-luna first when OPENAI_API_KEY is
-# configured, falling back to Gemma 4 31B on ModelRun and then Gemini 3.8/3.5 directly on Google.
-# Cantonese goes to Gemini 3.8/3.5 directly on Google first, falling back to Luna and Gemma.
-# Translations go to Gemma 4 31B on ModelRun first for speed in Story->Translate chains,
-# falling back to Gemini 3.8/3.5 directly on Google and then Luna.
+# Provider order: see the one lineup at GEMINI_FIRST_CODES below.
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
 OPENAI_LUNA_MODEL = "gpt-6-luna"
 OPENAI_LUNA_REASONING_EFFORT = "low"
@@ -956,6 +952,14 @@ def _is_gemini_first_language(value):
     return parts[0] in GEMINI_FIRST_CODES or (parts[0] == "zh" and ("hk" in parts[1:] or "mo" in parts[1:]))
 
 
+def _declared_languages(value):
+    """The "languages" list when well formed, else None (a 400)."""
+    if (not isinstance(value, list) or not 1 <= len(value) <= MAX_DECLARED_LANGUAGES
+            or not all(isinstance(v, str) and 0 < len(v.strip()) <= MAX_DECLARED_LANGUAGE_CHARS for v in value)):
+        return None
+    return [v.strip() for v in value]
+
+
 def _context_gemini_first(prompt):
     source = _CONTEXT_SOURCE_RE.search(prompt)
     target = _CONTEXT_TARGET_RE.search(prompt)
@@ -1164,7 +1168,7 @@ def _serve_gemini_context(api_key, payload):
         return jsonify({"error": "Upstream error"}), 502
 
 
-def _ai_context_explanation(payload):
+def _ai_context_explanation(payload, declared_gemini_first=False):
     # The phone owns cancellation/stale UI with AbortController + request ids. This
     # synchronous Flask handler cannot reliably observe that the client disconnected,
     # so an already-running chain may still proceed to the next provider and incur cost;
@@ -1199,7 +1203,8 @@ def _ai_context_explanation(payload):
               _gemini_context_contract)
     gemma = (CONTEXT_OPENROUTER_PROVIDER, lambda t: _openrouter_context_response(openrouter_key, prompt, t),
              _openrouter_context_contract)
-    chain = (gemini, luna, gemma) if _context_gemini_first(prompt) else (luna, gemini, gemma)
+    gemini_first = declared_gemini_first or _context_gemini_first(prompt)
+    chain = (gemini, luna, gemma) if gemini_first else (luna, gemini, gemma)
 
     deadline = time.monotonic() + CONTEXT_CHAIN_BUDGET_SECS
     for name, send, contract_of in chain:
@@ -1482,7 +1487,7 @@ def _openrouter_backup(api_key, payload):
     }
 
 
-def _ai_translation(payload):
+def _ai_translation(payload, declared_gemini_first=False):
     if not set(payload).issubset(TRANSLATION_ALLOWED_KEYS) or not _valid_text_payload(payload):
         return jsonify({"error": "Bad request"}), 400
     plain = {key: value for key, value in payload.items() if key != "purpose"}
@@ -1491,7 +1496,7 @@ def _ai_translation(payload):
     openai_key = os.environ.get("OPENAI_API_KEY", "")
     if not openrouter_key and not gemini_key and not openai_key:
         return jsonify({"error": "Server not configured"}), 503
-    return _text_chain(plain, _payload_gemini_first(plain))
+    return _text_chain(plain, declared_gemini_first or _payload_gemini_first(plain))
 
 
 # Initialize the IPA generator for Russian and Arabic
@@ -1569,19 +1574,24 @@ def ai_proxy():
             or 'contents' not in payload
             or not set(payload).issubset(ALLOWED_PAYLOAD_KEYS)):
         return jsonify({"error": "Bad request"}), 400
+    # Removed here, so no route below and no provider ever sees it.
+    languages = _declared_languages(payload.pop("languages")) if "languages" in payload else []
+    if languages is None:
+        return jsonify({"error": "Bad request"}), 400
+    declared_gemini_first = any(_is_gemini_first_language(lang) for lang in languages)
 
     if "purpose" in payload and payload.get("purpose") != TRANSLATION_PURPOSE:
-        return _ai_context_explanation(payload)
+        return _ai_context_explanation(payload, declared_gemini_first)
 
     try:
         if payload.get("purpose") == TRANSLATION_PURPOSE:
-            return _ai_translation(payload)
+            return _ai_translation(payload, declared_gemini_first)
         openai_key = os.environ.get("OPENAI_API_KEY", "")
         openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
         gemini_key = os.environ.get("GEMINI_API_KEY", "")
         if not openai_key and not gemini_key and not openrouter_key:
             return jsonify({"error": "Server not configured"}), 503
-        gemini_first = _payload_gemini_first(payload)
+        gemini_first = declared_gemini_first or _payload_gemini_first(payload)
         # Text goes somewhere other than Google first only when Luna leads.
         if openai_key and not gemini_first and not _valid_text_payload(payload):
             return jsonify({"error": "Bad request"}), 400

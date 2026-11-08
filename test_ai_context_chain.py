@@ -164,6 +164,14 @@ class AiContextChainTest(unittest.TestCase):
                 self.assertIn("gemini-3.8-flash", post.call_args_list[0].args[0])
                 self.assertEqual(post.call_args_list[1].args[0], api.OPENAI_CHAT_URL)
 
+    @patch("app.requests.post")
+    def test_declared_languages_also_steer_explanations(self, post):
+        post.side_effect = [FakeResponse(503, {}), openrouter_response(VALID_JSON)]
+        response = self.post_chain({**self.payload, "languages": ["ta", "English"]})
+        self.assert_contract(response)
+        self.assertIn("gemini-3.8-flash", post.call_args_list[0].args[0])
+        self.assertNotIn("languages", post.call_args_list[0].kwargs["json"])
+
     def test_ordinary_and_unknown_languages_are_not_gemini_first(self):
         for prompt in (
             'clicked on the word/phrase: "x" (Source Language: sw-KE).\nProvide all explanations and translations in English.',
