@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 import base64
+import hashlib
 import os
 import hmac
 import html
@@ -30,11 +31,21 @@ app = Flask(__name__)
 # - capacitor://localhost  = iOS Capacitor WebView (future)
 # - https://codeswitchreader.org = the old web app (still calls /generate-ipa;
 #   its /ai-proxy calls now 401 by design — it has no app key and is abandoned)
-CORS(app, origins=[
+CORS_ORIGINS = [
     "https://localhost",
     "capacitor://localhost",
     "https://codeswitchreader.org",
-])
+]
+# Web accounts switch (the section "Web accounts" below). Read here because the web
+# version's origins are allowed only while it is on: off = this list exactly as it was.
+# - https://app.meowti-lingual.com = the web version; http://localhost:8455 = the same
+#   pages served on Kit's laptop for testing. Both still need a signed-in session.
+WEB_ACCOUNTS_ENABLED = os.environ.get(
+    "WEB_ACCOUNTS_ENABLED", ""
+).strip().lower() in {"1", "true", "yes", "on"}
+if WEB_ACCOUNTS_ENABLED:
+    CORS_ORIGINS += ["https://app.meowti-lingual.com", "http://localhost:8455"]
+CORS(app, origins=CORS_ORIGINS)
 
 # ---------------------------------------------------------------------------
 # /ai-proxy protection (added 2026-07-07 — see memory api-security-spec)
@@ -219,6 +230,49 @@ SONG_LOOKUP_GLOBAL_PER_MINUTE = int(os.environ.get("SONG_LOOKUP_GLOBAL_PER_MINUT
 _song_lookup_hits = {}
 _song_lookup_global = []
 
+# ---------------------------------------------------------------------------
+# Web accounts (mobile SIGNIN_PLAN_TECH.md). A web page cannot hide an app key, so the web
+# version proves itself with a Google sign-in: /account/session checks Google's ID token and
+# hands back our own session, which the AI routes then accept beside the app key. Nothing
+# about a person is stored: the account id is derived from Google's id on every sign-in.
+# OFF until WEB_ACCOUNTS_ENABLED=1 (read beside the CORS list): until then no session is
+# issued or accepted and every route answers exactly as before.
+# ---------------------------------------------------------------------------
+# Public (it sits in the web page). The token's audience must be this client, or a token
+# made for someone else's site would sign in here. Android sign-in passes the same id.
+GOOGLE_WEB_CLIENT_ID = os.environ.get(
+    "GOOGLE_WEB_CLIENT_ID",
+    "539648342659-9quta52khmo8pnmm838c15ag0b8lvkda.apps.googleusercontent.com")
+ACCOUNT_SECRET_MIN_CHARS = 32
+ACCOUNT_RC_ID_RE = re.compile(r"^g_[0-9a-f]{64}$")
+# A custom header, not Authorization: Cloud Run reads Authorization for its own checks.
+SESSION_HEADER = "X-Account-Session"
+SESSION_TTL_SECS = 30 * 24 * 60 * 60
+SESSION_MAX_CHARS = 512
+# Raising this signs everyone out (old sessions stop verifying) without touching accounts.
+SESSION_KEY_VERSION = os.environ.get("SESSION_KEY_VERSION", "1")
+ACCOUNT_MAX_BODY_BYTES = 8 * 1024
+ACCOUNT_ID_TOKEN_MAX_CHARS = 4096
+# How long an account's Plus answer is reused before RevenueCat is asked again. "No" is
+# short so Plus bought on the phone shows up on the web within a minute.
+ACCOUNT_PLUS_YES_SECS = 10 * 60
+ACCOUNT_PLUS_NO_SECS = 60
+ACCOUNT_PLUS_FRESH_SECS = 15      # the "check again" routes
+ACCOUNT_PLUS_GRACE_SECS = 60 * 60  # RevenueCat not answering: a recent yes still counts
+# Per account, on top of the per-IP and server-wide limits: an account can script from many
+# addresses. In memory, like the IP limits. Starting numbers; Kit's call.
+ACCOUNT_RATE_PER_MINUTE = int(os.environ.get("ACCOUNT_RATE_PER_MINUTE", "15"))
+ACCOUNT_AI_DAILY = int(os.environ.get("ACCOUNT_AI_DAILY", "300"))
+ACCOUNT_DICT_DAILY = int(os.environ.get("ACCOUNT_DICT_DAILY", "100"))
+ACCOUNT_SIGNIN_MAX_PER_WINDOW = int(os.environ.get("ACCOUNT_SIGNIN_MAX_PER_WINDOW", "10"))
+ACCOUNT_SIGNIN_WINDOW_SECS = 10 * 60
+_account_lock = threading.Lock()
+_account_plus_cache = {}     # account id -> (has Plus, when answered)
+_account_lookups = {}        # account id -> one RevenueCat ask at a time (_account_has_plus)
+_account_minute_hits = {}    # account id -> [timestamps within the minute]
+_account_daily = {}          # (account id, bucket) -> [UTC day, count]
+_signin_ip_hits = {}         # ip -> [timestamps within the window]
+
 # In-memory rate limiting is deliberate: gunicorn runs 1 worker (8 threads
 # share this process), so no Redis needed at this scale.
 RATE_WINDOW_SECS = 60
@@ -247,14 +301,39 @@ def _authorized():
     return _key_matches(supplied, APP_KEY) or _key_matches(supplied, APP_KEY_NEXT)
 
 
-def _auth_refusal():
-    """The refusal for a request without a current app key, or None when it has one."""
+def _auth_refusal(web=None, bucket=None):
+    """The refusal for a request that may not come in, or None when it may.
+
+    The app proves itself with its key. `web` also opens the route to a signed-in web
+    account: "any" account, or only one with "plus" (the app checks Plus itself; a web page
+    cannot be trusted to). `bucket` names the account's daily count for this route.
+    """
     if _authorized():
         return None
     if _key_matches(request.headers.get('X-App-Key', ''), RETIRED_APP_KEY):
         # The app turns a 426 from our origin into "There's a new version… Open Google Play?"
         return jsonify({"error": "Please update the app"}), 426
-    return jsonify({"error": "Unauthorized"}), 401
+    token = request.headers.get(SESSION_HEADER, '') if web and WEB_ACCOUNTS_ENABLED else ''
+    if not token:
+        return jsonify({"error": "Unauthorized"}), 401
+    secret = _account_secret()
+    if not secret:
+        return jsonify({"error": "Server not configured"}), 503
+    account = _session_account(token, secret)
+    if not account:
+        return jsonify({"error": "Please sign in again.", "signIn": True}), 401
+    limited = _account_rate_limited(account, bucket)
+    if limited:
+        return limited
+    if web == "plus":
+        try:
+            has_plus = _account_has_plus(account)
+        except SongAllowanceUnavailable:
+            app.logger.warning("account Plus check unavailable")
+            return jsonify({"error": "We couldn't check your Plus just now. Please try again soon."}), 503
+        if not has_plus:
+            return jsonify({"error": "This is part of Plus.", "plusRequired": True}), 403
+    return None
 
 
 def _rate_limited():
@@ -540,6 +619,240 @@ def _revenuecat_call_allowed():
         if len(recent) >= SONG_LOOKUP_GLOBAL_PER_MINUTE:
             raise SongAllowanceUnavailable("RevenueCat call budget used up")
         _song_lookup_global.append(now)
+
+
+class AccountSignInUnavailable(Exception):
+    """Google's keys could not be fetched, so a token can be neither trusted nor refused."""
+
+
+def _account_secret():
+    # Too short to be the real one (a typo, a placeholder) counts as not set.
+    secret = os.environ.get("ACCOUNT_ID_SECRET", "")
+    return secret.encode("utf-8") if len(secret) >= ACCOUNT_SECRET_MIN_CHARS else b""
+
+
+def _account_id(google_sub, secret):
+    """Our id for a Google account, which is also its RevenueCat customer id.
+
+    NEVER change this recipe or ACCOUNT_ID_SECRET: RevenueCat keeps the account's Plus
+    under this id, so a different id strands every signed-in purchase. Unguessable without
+    the secret (anyone holding an id can read its Plus status with the app's public key).
+    """
+    return "g_" + hmac.new(secret, b"rc-id:" + google_sub.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _b64url(raw):
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _session_signature(signed_part, secret):
+    key = hmac.new(secret, b"session:" + SESSION_KEY_VERSION.encode("utf-8"), hashlib.sha256).digest()
+    return _b64url(hmac.new(key, signed_part.encode("utf-8"), hashlib.sha256).digest())
+
+
+def _issue_session(account, secret):
+    """A signed note saying "this is account X until then". Nothing is stored: signing out
+    is the browser forgetting it. Signed, not hidden: its holder can read the account id,
+    which is their own (the phone app holds its RevenueCat id in the clear too)."""
+    body = json.dumps({"rc": account, "exp": int(time.time()) + SESSION_TTL_SECS},
+                      separators=(",", ":"))
+    signed_part = "v1." + _b64url(body.encode("utf-8"))
+    return signed_part + "." + _session_signature(signed_part, secret)
+
+
+def _session_account(token, secret):
+    """The account a session belongs to, or None (forged, expired, or not one of ours)."""
+    if not isinstance(token, str) or len(token) > SESSION_MAX_CHARS:
+        return None
+    parts = token.split(".")
+    if len(parts) != 3 or parts[0] != "v1":
+        return None
+    expected = _session_signature("v1." + parts[1], secret)
+    if not hmac.compare_digest(parts[2].encode("utf-8"), expected.encode("utf-8")):
+        return None
+    try:
+        body = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
+    except ValueError:
+        return None
+    if not isinstance(body, dict):
+        return None
+    account, expires = body.get("rc"), body.get("exp")
+    if not isinstance(account, str) or not ACCOUNT_RC_ID_RE.match(account):
+        return None
+    if type(expires) is not int or expires <= time.time():
+        return None
+    return account
+
+
+def _google_certs_transport():
+    """How Google's public keys are fetched, with a timeout (the library's own is 2 minutes)."""
+    from google.auth import exceptions as google_exceptions
+    from google.auth.transport import requests as google_requests
+    fetch = google_requests.Request()
+
+    def transport(url, method="GET", **kwargs):
+        kwargs.setdefault("timeout", 10)
+        response = fetch(url, method=method, **kwargs)
+        if response.status == 200:
+            # The library reads this answer outside its own "unreachable" handling, so a
+            # garbled one would look like a bad token (Sol 11/11).
+            try:
+                keys = json.loads(response.data.decode("utf-8"))
+            except ValueError as error:
+                raise google_exceptions.TransportError("Google's keys unreadable") from error
+            if not isinstance(keys, dict) or not keys:
+                raise google_exceptions.TransportError("Google's keys unreadable")
+        return response
+    return transport
+
+
+def _google_account_sub(id_token):
+    """Google's permanent id for the account behind an ID token, or None when the token is
+    not a good one for this app (forged, expired, made for another site, not Google's).
+    The email in the token is never read."""
+    try:
+        from google.auth import exceptions as google_exceptions
+        from google.oauth2 import id_token as google_id_token
+        transport = _google_certs_transport()
+    except Exception as error:
+        raise AccountSignInUnavailable("google-auth is not usable") from error
+    try:
+        # Checks the signature against Google's keys, the expiry, that the audience is OUR
+        # client id, and that Google issued it.
+        claims = google_id_token.verify_oauth2_token(
+            id_token, transport, audience=GOOGLE_WEB_CLIENT_ID, clock_skew_in_seconds=10)
+    except google_exceptions.TransportError as error:
+        raise AccountSignInUnavailable("Google's keys unreachable") from error
+    except Exception:
+        return None
+    sub = claims.get("sub") if isinstance(claims, dict) else None
+    return sub if isinstance(sub, str) and 0 < len(sub) <= 255 else None
+
+
+def _account_plus_cached(account, fresh):
+    """The last answer while it is still young enough to reuse, else None."""
+    with _account_lock:
+        cached = _account_plus_cache.get(account)
+    if not cached:
+        return None
+    keep = (ACCOUNT_PLUS_FRESH_SECS if fresh
+            else ACCOUNT_PLUS_YES_SECS if cached[0] else ACCOUNT_PLUS_NO_SECS)
+    return cached[0] if time.time() - cached[1] < keep else None
+
+
+def _account_has_plus(account, fresh=False):
+    """Whether this account has Plus now, asking RevenueCat only when the last answer is
+    old. Raises SongAllowanceUnavailable when RevenueCat can't answer and no recent yes
+    stands in.
+
+    One ask at a time per account: requests arriving together wait and share the answer
+    (RevenueCat's budget is shared with songs), and an answer that was slow to arrive can
+    never replace a newer one. A FAILED ask is shared the same way, with those who were
+    already waiting for it: otherwise each would queue up its own slow failure and one
+    account could hold every worker thread through an outage (Sol 11/11).
+    """
+    cached = _account_plus_cached(account, fresh)
+    if cached is not None:
+        return cached
+    with _account_lock:
+        # [lock, threads holding or waiting, failed asks so far]
+        lookup = _account_lookups.setdefault(account, [threading.Lock(), 0, 0])
+        lookup[1] += 1
+        failures_before = lookup[2]
+    try:
+        with lookup[0]:
+            cached = _account_plus_cached(account, fresh)
+            if cached is not None:
+                return cached
+            failed = None
+            if lookup[2] != failures_before:
+                failed = SongAllowanceUnavailable("the ask this request waited for failed")
+            else:
+                try:
+                    # The same question songs ask: any purchase that gives access is Plus.
+                    has_plus = bool(_plus_subscriptions(account))
+                except SongAllowanceUnavailable as error:
+                    lookup[2] += 1
+                    failed = error
+            if failed:
+                with _account_lock:
+                    last = _account_plus_cache.get(account)
+                if last and last[0] and time.time() - last[1] < ACCOUNT_PLUS_GRACE_SECS:
+                    return True
+                raise failed
+            now = time.time()
+            with _account_lock:
+                _account_plus_cache[account] = (has_plus, now)
+                if len(_account_plus_cache) > 10000:
+                    for key in list(_account_plus_cache):
+                        if now - _account_plus_cache[key][1] >= ACCOUNT_PLUS_GRACE_SECS:
+                            del _account_plus_cache[key]
+            return has_plus
+    finally:
+        with _account_lock:
+            lookup[1] -= 1
+            if not lookup[1] and _account_lookups.get(account) is lookup:
+                del _account_lookups[account]
+
+
+def _account_plus_or_none(account, fresh=False):
+    # For answers that only REPORT Plus: None = "couldn't check", so a RevenueCat hiccup
+    # never fails a sign-in.
+    try:
+        return _account_has_plus(account, fresh)
+    except SongAllowanceUnavailable:
+        app.logger.warning("account Plus check unavailable")
+        return None
+
+
+def _account_rate_limited(account, bucket=None):
+    """Per-account limits: a minute window for every route, and a daily count per bucket
+    ("ai" = the Plus routes, "dict" = the free dictionary step)."""
+    now = time.time()
+    today = time.strftime('%Y-%m-%d', time.gmtime())
+    with _account_lock:
+        hits = [t for t in _account_minute_hits.get(account, []) if now - t < RATE_WINDOW_SECS]
+        if len(hits) >= ACCOUNT_RATE_PER_MINUTE:
+            _account_minute_hits[account] = hits
+            return jsonify({"error": "Too many requests. Please slow down."}), 429
+        if bucket:
+            limit = ACCOUNT_AI_DAILY if bucket == "ai" else ACCOUNT_DICT_DAILY
+            daily = _account_daily.get((account, bucket))
+            if not daily or daily[0] != today:
+                daily = [today, 0]
+            if daily[1] >= limit:
+                return jsonify({"error": "That's all for today. Please come back tomorrow."}), 429
+            daily[1] += 1
+            _account_daily[(account, bucket)] = daily
+        hits.append(now)
+        _account_minute_hits[account] = hits
+        if len(_account_minute_hits) > 10000:
+            for key in list(_account_minute_hits):
+                if not any(now - t < RATE_WINDOW_SECS for t in _account_minute_hits[key]):
+                    del _account_minute_hits[key]
+        if len(_account_daily) > 20000:
+            for key in list(_account_daily):
+                if _account_daily[key][0] != today:
+                    del _account_daily[key]
+    return None
+
+
+def _signin_rate_limited():
+    """Sign-in attempts per IP: each one makes this server fetch Google's keys."""
+    now = time.time()
+    ip = _client_ip()
+    with _account_lock:
+        hits = [t for t in _signin_ip_hits.get(ip, []) if now - t < ACCOUNT_SIGNIN_WINDOW_SECS]
+        if len(hits) >= ACCOUNT_SIGNIN_MAX_PER_WINDOW:
+            _signin_ip_hits[ip] = hits
+            return jsonify({"error": "Too many sign-in tries. Please try again in about 10 minutes."}), 429
+        hits.append(now)
+        _signin_ip_hits[ip] = hits
+        if len(_signin_ip_hits) > 10000:
+            for key in list(_signin_ip_hits):
+                if not any(now - t < ACCOUNT_SIGNIN_WINDOW_SECS for t in _signin_ip_hits[key]):
+                    del _signin_ip_hits[key]
+    return None
 
 
 def _clean_report_field(value, max_chars, required=False):
@@ -1560,7 +1873,7 @@ def ai_proxy():
     # (Auth before rate limit so anonymous floods can't drain the daily budget.)
     if not APP_KEY:
         return jsonify({"error": "Server not configured"}), 503
-    refused = _auth_refusal()
+    refused = _auth_refusal(web="plus", bucket="ai")
     if refused:
         return refused
     limited = _rate_limited()
@@ -1730,7 +2043,7 @@ def dict_fallback():
     # Order matches /ai-proxy: config -> auth -> rate -> size -> exact shape.
     if not APP_KEY:
         return jsonify({"error": "Server not configured"}), 503
-    refused = _auth_refusal()
+    refused = _auth_refusal(web="any", bucket="dict")
     if refused:
         return refused
     limited = _rate_limited()
@@ -1801,7 +2114,7 @@ def report_ai_output():
     # reports cannot consume (or be blocked by) the generation quota.
     if not APP_KEY:
         return jsonify({"error": "Server not configured"}), 503
-    refused = _auth_refusal()
+    refused = _auth_refusal(web="any")
     if refused:
         return refused
     if (request.content_length or 0) > REPORT_MAX_BODY_BYTES:
@@ -1830,6 +2143,55 @@ def report_ai_output():
     with _report_log_lock:
         print(json.dumps(record, ensure_ascii=False, separators=(',', ':')), flush=True)
     return jsonify({"ok": True, "reportId": report_id}), 201
+
+
+@app.route('/account/session', methods=['POST'])
+def account_session():
+    """Trade Google's ID token for our session. Order: switch -> config -> rate -> size ->
+    exact shape -> Google's check."""
+    if not WEB_ACCOUNTS_ENABLED:
+        return jsonify({"error": "Sign-in is not enabled"}), 503
+    secret = _account_secret()
+    if not secret or not GOOGLE_WEB_CLIENT_ID:
+        return jsonify({"error": "Server not configured"}), 503
+    limited = _signin_rate_limited()
+    if limited:
+        return limited
+    if (request.content_length or 0) > ACCOUNT_MAX_BODY_BYTES:
+        return jsonify({"error": "Request too large"}), 413
+    payload = request.get_json(silent=True)
+    if (not isinstance(payload, dict) or set(payload) != {"idToken"}
+            or not isinstance(payload["idToken"], str)
+            or not 0 < len(payload["idToken"]) <= ACCOUNT_ID_TOKEN_MAX_CHARS):
+        return jsonify({"error": "Bad request"}), 400
+    try:
+        google_sub = _google_account_sub(payload["idToken"])
+    except AccountSignInUnavailable:
+        app.logger.warning("sign-in check unavailable")
+        return jsonify({"error": "We couldn't check your sign-in just now. Please try again soon."}), 503
+    if not google_sub:
+        return jsonify({"error": "Sign-in failed. Please try again."}), 401
+    account = _account_id(google_sub, secret)
+    # rcId is what the app hands to RevenueCat (Purchases.logIn) so Plus follows the account.
+    return jsonify({"session": _issue_session(account, secret), "rcId": account,
+                    "plus": _account_plus_or_none(account, fresh=True)})
+
+
+@app.route('/account', methods=['GET'])
+def account_status():
+    """Whether the signed-in account has Plus now (the web's "check again")."""
+    if not WEB_ACCOUNTS_ENABLED:
+        return jsonify({"error": "Sign-in is not enabled"}), 503
+    secret = _account_secret()
+    if not secret:
+        return jsonify({"error": "Server not configured"}), 503
+    account = _session_account(request.headers.get(SESSION_HEADER, ''), secret)
+    if not account:
+        return jsonify({"error": "Please sign in again.", "signIn": True}), 401
+    limited = _account_rate_limited(account)
+    if limited:
+        return limited
+    return jsonify({"plus": _account_plus_or_none(account, fresh=True)})
 
 
 # /ai-context was DELETED 2026-07-07: confirmed dead route (zero references in
