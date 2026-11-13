@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import app as api
 
@@ -64,9 +64,12 @@ class AccountTestCase(unittest.TestCase):
         self.rc_calls = []
         self.google_calls = []
         self.google_down = False
+        self.deletion_record = Mock()
+        self.deletion_record.get.return_value.to_dict.return_value = None
         self.patches = [
             patch.object(api.requests, "get", self.fake_revenuecat),
             patch.object(api, "_google_account_sub", self.fake_google),
+            patch.object(api, "_account_deletion_record", return_value=self.deletion_record),
         ]
         for item in self.patches:
             item.start()
@@ -226,6 +229,106 @@ class SignInTest(AccountTestCase):
                          [401, 401, 401, 429])
         self.assertEqual(len(self.google_calls), 3, "a refused try never reaches Google")
         self.assertEqual(self.sign_in(headers={"X-Forwarded-For": "203.0.113.6"}).status_code, 200)
+
+
+class AccountDeletionTest(AccountTestCase):
+    MISSING_CUSTOMER = StubResponse({"type": "resource_missing"}, status_code=404)
+
+    def delete(self, payload=None):
+        if payload is None:
+            payload = {"idToken": "good:" + GOOGLE_SUB}
+        return self.client.delete("/account", json=payload)
+
+    @patch.dict("os.environ", {"REVENUECAT_DELETE_KEY": "sk_delete"})
+    def test_requires_google_proof_for_the_account_being_deleted(self):
+        with patch.object(api, "_revoke_account_sessions") as revoke, \
+                patch.object(api.requests, "delete") as delete:
+            self.assertEqual(self.delete({"idToken": "forged"}).status_code, 401)
+            self.assertEqual(self.delete({"idToken": "good:999", "expectedAccount": ACCOUNT}).status_code, 409)
+            self.assertEqual(self.delete({"idToken": "good:999", "rcId": ACCOUNT}).status_code, 400)
+            revoke.assert_not_called()
+            delete.assert_not_called()
+
+    @patch.dict("os.environ", {"REVENUECAT_DELETE_KEY": "sk_delete"})
+    def test_deletion_revokes_existing_sessions_and_uses_only_the_verified_id(self):
+        old, other = self.session(), self.session("999")
+        cutoff = datetime.datetime.now(datetime.timezone.utc)
+
+        def revoke(account, secret):
+            self.assertEqual(account, ACCOUNT)
+            self.deletion_record.get.return_value.to_dict.return_value = {"revokedBefore": cutoff}
+
+        self.plus_accounts.add(ACCOUNT)
+        with patch.object(api, "_revoke_account_sessions", side_effect=revoke), \
+                patch.object(api.requests, "delete", return_value=StubResponse(status_code=200)) as delete, \
+                patch.object(api.requests, "get", return_value=self.MISSING_CUSTOMER) as get:
+            response = self.delete({"idToken": "good:" + GOOGLE_SUB, "expectedAccount": ACCOUNT})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.get_json(), {"status": "deleted", "rcId": ACCOUNT})
+            url = f"{api.REVENUECAT_API}/projects/{api.REVENUECAT_PROJECT_ID}/customers/{ACCOUNT}"
+            delete.assert_called_once_with(url, headers={"Authorization": "Bearer sk_delete"},
+                                           timeout=(5, 10), allow_redirects=False)
+            get.assert_called_once_with(url, headers={"Authorization": "Bearer sk_delete"},
+                                        timeout=(5, 10), allow_redirects=False)
+        self.assertEqual(self.call("/dict-fallback", session=old).status_code, 401)
+        self.assertEqual(self.client.get("/account", headers={api.SESSION_HEADER: old}).status_code, 401)
+        with patch.object(api, "_account_deletion_record") as record:
+            record.return_value.get.return_value.to_dict.return_value = None
+            self.assertEqual(self.call("/dict-fallback", session=other).status_code, 400)
+        fresh = api._issue_session(ACCOUNT, api._account_secret(), cutoff.timestamp() + 2)
+        self.assertEqual(self.call("/dict-fallback", session=fresh).status_code, 400)
+
+    @patch.dict("os.environ", {"REVENUECAT_DELETE_KEY": "sk_delete"})
+    def test_distinguishes_queued_confirmed_and_failed_deletion(self):
+        with patch.object(api, "_revoke_account_sessions"), \
+                patch.object(api.requests, "delete") as delete, patch.object(api.requests, "get") as get:
+            delete.return_value = StubResponse(status_code=200)
+            get.return_value = StubResponse(status_code=200)
+            self.assertEqual(self.delete().status_code, 202)
+            get.side_effect = api.requests.ConnectionError("unavailable")
+            self.assertEqual(self.delete().status_code, 202)
+            delete.return_value = self.MISSING_CUSTOMER
+            self.assertEqual(self.delete().get_json()["status"], "deleted")
+            delete.return_value = StubResponse(status_code=404)
+            self.assertEqual(self.delete().status_code, 503)
+            delete.return_value = StubResponse(status_code=403)
+            self.assertEqual(self.delete().status_code, 503)
+
+    @patch.dict("os.environ", {"REVENUECAT_DELETE_KEY": "sk_delete"})
+    def test_store_failure_never_sends_the_delete_to_revenuecat(self):
+        with patch.object(api, "_revoke_account_sessions", side_effect=RuntimeError("store down")), \
+                patch.object(api.requests, "delete") as delete:
+            self.assertEqual(self.delete().status_code, 503)
+            delete.assert_not_called()
+
+    def check_link(self, proof):
+        return self.client.get("/account/phone-link", headers={api.SESSION_HEADER: proof})
+
+    def test_phone_link_can_check_for_deletion_only(self):
+        response = self.sign_in(body={"idToken": "good:" + GOOGLE_SUB, "phoneLink": True})
+        proof = response.get_json()["phoneLink"]
+        self.assertEqual(self.check_link(proof).get_json(), {"revoked": False})
+        self.assertEqual(self.check_link(response.get_json()["session"]).status_code, 401)
+        self.assertEqual(self.call("/dict-fallback", session=proof).status_code, 401)
+        self.deletion_record.get.return_value.to_dict.return_value = {
+            "revokedBefore": datetime.datetime.now(datetime.timezone.utc)}
+        self.assertEqual(self.check_link(proof).get_json(), {"revoked": True})
+
+    @patch.dict("os.environ", {"REVENUECAT_DELETE_KEY": "sk_delete"})
+    def test_an_older_phone_link_uses_a_lookup_that_cannot_create_a_customer(self):
+        first_issued = time.time() - 32 * 24 * 60 * 60
+        proof = api._issue_session(ACCOUNT, api._account_secret(), first_issued, version="p1")
+        with patch.object(api.requests, "get") as get:
+            get.return_value = self.MISSING_CUSTOMER
+            self.assertEqual(self.check_link(proof).get_json(), {"revoked": True})
+            self.assertTrue(get.call_args.args[0].endswith(f"/customers/{ACCOUNT}"))
+            get.return_value = StubResponse({"first_seen_at": int(time.time() * 1000)})
+            self.assertEqual(self.check_link(proof).get_json(), {"revoked": True})
+            get.return_value = StubResponse({"first_seen_at": int((first_issued + 5) * 1000)})
+            renewed = self.check_link(proof).get_json()
+            self.assertFalse(renewed["revoked"])
+            self.assertNotEqual(renewed["phoneLink"], proof)
+            self.assertEqual(self.call("/dict-fallback", session=renewed["phoneLink"]).status_code, 401)
 
 
 class SessionTest(AccountTestCase):
@@ -521,6 +624,17 @@ class CorsTest(unittest.TestCase):
         for key, (allowed, _) in seen.items():
             origin = key.split(" ")[0]
             self.assertEqual(allowed, origin if origin in APP_ORIGINS else None, key)
+
+    def test_account_delete_accepts_json_preflight(self):
+        response = api.app.test_client().options("/account", headers={
+            "Origin": "https://localhost",
+            "Access-Control-Request-Method": "DELETE",
+            "Access-Control-Request-Headers": "content-type",
+        })
+        self.assertIn("DELETE", response.headers["Allow"])
+        self.assertIn("DELETE", response.headers["Access-Control-Allow-Methods"])
+        self.assertEqual(response.headers["Access-Control-Allow-Origin"], "https://localhost")
+        self.assertIn("content-type", response.headers["Access-Control-Allow-Headers"].lower())
 
 
 try:

@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 import base64
+from datetime import datetime, timedelta, timezone
 import hashlib
 import os
 import hmac
@@ -319,12 +320,9 @@ def _auth_refusal(web=None, bucket=None):
     secret = _account_secret()
     if not secret:
         return jsonify({"error": "Server not configured"}), 503
-    account = _session_account(token, secret)
-    if not account:
-        return jsonify({"error": "Please sign in again.", "signIn": True}), 401
-    limited = _account_rate_limited(account, bucket)
-    if limited:
-        return limited
+    account, refusal = _active_account_session(token, secret, bucket)
+    if refusal:
+        return refusal
     if web == "plus":
         try:
             has_plus = _account_has_plus(account)
@@ -646,28 +644,30 @@ def _b64url(raw):
 
 
 def _session_signature(signed_part, secret):
-    key = hmac.new(secret, b"session:" + SESSION_KEY_VERSION.encode("utf-8"), hashlib.sha256).digest()
+    purpose = b"phone-link:v1" if signed_part.startswith("p1.") else b"session:" + SESSION_KEY_VERSION.encode("utf-8")
+    key = hmac.new(secret, purpose, hashlib.sha256).digest()
     return _b64url(hmac.new(key, signed_part.encode("utf-8"), hashlib.sha256).digest())
 
 
-def _issue_session(account, secret):
+def _issue_session(account, secret, issued_at=None, version="v1"):
     """A signed note saying "this is account X until then". Nothing is stored: signing out
     is the browser forgetting it. Signed, not hidden: its holder can read the account id,
     which is their own (the phone app holds its RevenueCat id in the clear too)."""
-    body = json.dumps({"rc": account, "exp": int(time.time()) + SESSION_TTL_SECS},
+    issued_at = time.time() if issued_at is None else issued_at
+    body = json.dumps({"rc": account, "exp": int(issued_at) + SESSION_TTL_SECS},
                       separators=(",", ":"))
-    signed_part = "v1." + _b64url(body.encode("utf-8"))
+    signed_part = version + "." + _b64url(body.encode("utf-8"))
     return signed_part + "." + _session_signature(signed_part, secret)
 
 
-def _session_account(token, secret):
-    """The account a session belongs to, or None (forged, expired, or not one of ours)."""
+def _read_session(token, secret, version="v1"):
+    """Verify the token's signature, purpose, and (for a web session) expiry."""
     if not isinstance(token, str) or len(token) > SESSION_MAX_CHARS:
         return None
     parts = token.split(".")
-    if len(parts) != 3 or parts[0] != "v1":
+    if len(parts) != 3 or parts[0] != version:
         return None
-    expected = _session_signature("v1." + parts[1], secret)
+    expected = _session_signature(version + "." + parts[1], secret)
     if not hmac.compare_digest(parts[2].encode("utf-8"), expected.encode("utf-8")):
         return None
     try:
@@ -679,9 +679,82 @@ def _session_account(token, secret):
     account, expires = body.get("rc"), body.get("exp")
     if not isinstance(account, str) or not ACCOUNT_RC_ID_RE.match(account):
         return None
-    if type(expires) is not int or expires <= time.time():
+    if type(expires) is not int or (version == "v1" and expires <= time.time()):
         return None
-    return account
+    return body
+
+
+def _account_deletion_record(account, secret):
+    # The revocation record can be found with the server secret, but does not store
+    # the RevenueCat customer ID or anything from the Google credential.
+    key = hmac.new(secret, b"account-deletion:" + account.encode("ascii"), hashlib.sha256).hexdigest()
+    return _firestore().collection("account_deletions").document(key)
+
+
+def _account_link_revoked(body, secret):
+    record = _account_deletion_record(body["rc"], secret).get(timeout=5).to_dict()
+    # The fixed expiry encodes when both old sessions and phone links were issued.
+    return bool(record and body["exp"] - SESSION_TTL_SECS <= record["revokedBefore"].timestamp())
+
+
+def _active_account_session(token, secret, bucket=None):
+    body = _read_session(token, secret)
+    if not body:
+        return None, (jsonify({"error": "Please sign in again.", "signIn": True}), 401)
+    account = body["rc"]
+    limited = _account_rate_limited(account, bucket)
+    if limited:
+        return None, limited
+    try:
+        revoked = _account_link_revoked(body, secret)
+    except Exception:
+        app.logger.warning("account deletion status unavailable")
+        return None, (jsonify({"error": "Couldn't check your account. Please try again soon."}), 503)
+    if revoked:
+        return None, (jsonify({"error": "Please sign in again.", "signIn": True}), 401)
+    return account, None
+
+
+def _revoke_account_sessions(account, secret):
+    from google.cloud import firestore
+
+    _account_deletion_record(account, secret).set({
+        "revokedBefore": firestore.SERVER_TIMESTAMP,
+        "expiresAt": datetime.now(timezone.utc) + timedelta(days=31),
+    }, timeout=5)
+    with _account_lock:
+        _account_plus_cache.pop(account, None)
+
+
+def _revenuecat_customer_request(method, account, key):
+    url = f"{REVENUECAT_API}/projects/{REVENUECAT_PROJECT_ID}/customers/{account}"
+    headers = {"Authorization": f"Bearer {key}"}
+    _revenuecat_call_allowed()
+    return method(url, headers=headers, timeout=(5, 10), allow_redirects=False)
+
+
+def _revenuecat_customer_missing(response):
+    if response.status_code != 404:
+        return False
+    try:
+        body = response.json()
+    except ValueError:
+        return False
+    return isinstance(body, dict) and body.get("type") == "resource_missing"
+
+
+def _delete_revenuecat_customer(account, key):
+    """Return whether RevenueCat has confirmed deletion. A 200 only queues it."""
+    response = _revenuecat_customer_request(requests.delete, account, key)
+    if _revenuecat_customer_missing(response):
+        return True
+    if response.status_code != 200:
+        raise SongAllowanceUnavailable(f"RevenueCat delete status {response.status_code}")
+    try:
+        result = _revenuecat_customer_request(requests.get, account, key)
+        return _revenuecat_customer_missing(result)
+    except (requests.RequestException, SongAllowanceUnavailable):
+        return False
 
 
 def _google_certs_transport():
@@ -2154,13 +2227,15 @@ def account_session():
     secret = _account_secret()
     if not secret or not GOOGLE_WEB_CLIENT_ID:
         return jsonify({"error": "Server not configured"}), 503
+    issued_at = time.time()
     limited = _signin_rate_limited()
     if limited:
         return limited
     if (request.content_length or 0) > ACCOUNT_MAX_BODY_BYTES:
         return jsonify({"error": "Request too large"}), 413
     payload = request.get_json(silent=True)
-    if (not isinstance(payload, dict) or set(payload) != {"idToken"}
+    if (not isinstance(payload, dict) or set(payload) not in ({"idToken"}, {"idToken", "phoneLink"})
+            or ("phoneLink" in payload and payload["phoneLink"] is not True)
             or not isinstance(payload["idToken"], str)
             or not 0 < len(payload["idToken"]) <= ACCOUNT_ID_TOKEN_MAX_CHARS):
         return jsonify({"error": "Bad request"}), 400
@@ -2173,8 +2248,13 @@ def account_session():
         return jsonify({"error": "Sign-in failed. Please try again."}), 401
     account = _account_id(google_sub, secret)
     # rcId is what the app hands to RevenueCat (Purchases.logIn) so Plus follows the account.
-    return jsonify({"session": _issue_session(account, secret), "rcId": account,
-                    "plus": _account_plus_or_none(account, fresh=True)})
+    result = {"session": _issue_session(account, secret, issued_at), "rcId": account,
+              "plus": _account_plus_or_none(account, fresh=True)}
+    if payload.get("phoneLink"):
+        # This proof only checks the status of a saved phone link. It cannot open AI routes
+        # or delete an account, and must work even if the phone sat unused for over a month.
+        result["phoneLink"] = _issue_session(account, secret, issued_at, version="p1")
+    return jsonify(result)
 
 
 @app.route('/account', methods=['GET'])
@@ -2185,13 +2265,87 @@ def account_status():
     secret = _account_secret()
     if not secret:
         return jsonify({"error": "Server not configured"}), 503
-    account = _session_account(request.headers.get(SESSION_HEADER, ''), secret)
-    if not account:
-        return jsonify({"error": "Please sign in again.", "signIn": True}), 401
-    limited = _account_rate_limited(account)
+    account, refusal = _active_account_session(request.headers.get(SESSION_HEADER, ''), secret)
+    if refusal:
+        return refusal
+    return jsonify({"plus": _account_plus_or_none(account, fresh=True)})
+
+
+@app.route('/account', methods=['DELETE'])
+def account_delete():
+    """Delete only the account proved by a Google credential obtained for this action."""
+    if not WEB_ACCOUNTS_ENABLED:
+        return jsonify({"error": "Sign-in is not enabled"}), 503
+    secret = _account_secret()
+    key = os.environ.get("REVENUECAT_DELETE_KEY", "")
+    if not secret or not GOOGLE_WEB_CLIENT_ID or not key:
+        return jsonify({"error": "Account deletion is temporarily unavailable."}), 503
+    limited = _signin_rate_limited()
     if limited:
         return limited
-    return jsonify({"plus": _account_plus_or_none(account, fresh=True)})
+    if (request.content_length or 0) > ACCOUNT_MAX_BODY_BYTES:
+        return jsonify({"error": "Request too large"}), 413
+    payload = request.get_json(silent=True)
+    if (not isinstance(payload, dict) or set(payload) not in ({"idToken"}, {"idToken", "expectedAccount"})
+            or not isinstance(payload["idToken"], str)
+            or not 0 < len(payload["idToken"]) <= ACCOUNT_ID_TOKEN_MAX_CHARS):
+        return jsonify({"error": "Bad request"}), 400
+    try:
+        google_sub = _google_account_sub(payload["idToken"])
+    except AccountSignInUnavailable:
+        return jsonify({"error": "Couldn't verify your Google sign-in. Please try again."}), 503
+    if not google_sub:
+        return jsonify({"error": "Please sign in with Google again."}), 401
+    account = _account_id(google_sub, secret)
+    if "expectedAccount" in payload and payload["expectedAccount"] != account:
+        return jsonify({"error": "Choose the Google account you used to sign in to Meowti-lingual."}), 409
+    try:
+        _revoke_account_sessions(account, secret)
+        deleted = _delete_revenuecat_customer(account, key)
+    except Exception:
+        app.logger.warning("account deletion could not be confirmed or queued")
+        return jsonify({"error": "Couldn't complete the deletion request. Please try again."}), 503
+    return jsonify({"status": "deleted" if deleted else "pending", "rcId": account}), 200 if deleted else 202
+
+
+@app.route('/account/phone-link', methods=['GET'])
+def account_phone_link():
+    """Check a saved link before the SDK can recreate a deleted RevenueCat customer."""
+    if not WEB_ACCOUNTS_ENABLED:
+        return jsonify({"error": "Sign-in is not enabled"}), 503
+    secret = _account_secret()
+    if not secret:
+        return jsonify({"error": "Server not configured"}), 503
+    body = _read_session(request.headers.get(SESSION_HEADER, ''), secret, version="p1")
+    if not body:
+        return jsonify({"error": "Invalid phone link"}), 401
+    limited = _rate_limited()
+    if limited:
+        return limited
+    checked_at = time.time()
+    try:
+        if _account_link_revoked(body, secret):
+            return jsonify({"revoked": True})
+        key = os.environ.get("REVENUECAT_DELETE_KEY", "")
+        if key and body["exp"] <= checked_at:
+            # The Firestore record may already have expired. API v2 checks without
+            # creating the customer. Renew the proof only if that customer still exists.
+            result = _revenuecat_customer_request(requests.get, body["rc"], key)
+            if _revenuecat_customer_missing(result):
+                return jsonify({"revoked": True})
+            if result.status_code != 200:
+                raise SongAllowanceUnavailable("RevenueCat customer lookup failed")
+            first_seen = result.json().get("first_seen_at")
+            if type(first_seen) is not int:
+                raise SongAllowanceUnavailable("RevenueCat customer timestamp missing")
+            # A customer can be created just after the phone received its first proof.
+            if first_seen / 1000 > body["exp"] - SESSION_TTL_SECS + 5 * 60:
+                return jsonify({"revoked": True})
+            return jsonify({"revoked": False, "phoneLink": _issue_session(body["rc"], secret, checked_at, version="p1")})
+    except Exception:
+        app.logger.warning("phone link status unavailable")
+        return jsonify({"error": "Couldn't check your account. Please try again soon."}), 503
+    return jsonify({"revoked": False})
 
 
 # /ai-context was DELETED 2026-07-07: confirmed dead route (zero references in
