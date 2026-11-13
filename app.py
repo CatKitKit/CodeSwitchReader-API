@@ -308,7 +308,9 @@ def _auth_refusal(web=None, bucket=None):
     The app proves itself with its key. `web` also opens the route to a signed-in web
     account: "any" account, or only one with "plus" (the app checks Plus itself; a web page
     cannot be trusted to). `bucket` names the account's daily count for this route.
+    A web caller that may come in is left in g.web_account for the route to read.
     """
+    g.web_account = None
     if _authorized():
         return None
     if _key_matches(request.headers.get('X-App-Key', ''), RETIRED_APP_KEY):
@@ -331,6 +333,7 @@ def _auth_refusal(web=None, bucket=None):
             return jsonify({"error": "We couldn't check your Plus just now. Please try again soon."}), 503
         if not has_plus:
             return jsonify({"error": "This is part of Plus.", "plusRequired": True}), 403
+    g.web_account = account
     return None
 
 
@@ -1993,7 +1996,9 @@ def song_bake():
     # launch switch, exact payload, and separate cost limit ahead of the Lyria call.
     if not APP_KEY:
         return jsonify({"error": "Server not configured"}), 503
-    refused = _auth_refusal()
+    # "any", not "plus": the song's own check below asks RevenueCat for the purchase itself
+    # (it needs its id to count), so asking here too would spend a second call.
+    refused = _auth_refusal(web="any")
     if refused:
         return refused
     if not SONG_GENERATION_ENABLED:
@@ -2013,8 +2018,12 @@ def song_bake():
     if limited:
         return limited
     songs_left = None
-    if SONG_PLUS_REQUIRED:
-        refused = _song_plus_check(fields["rcUserId"])
+    # A web account is the one its session names, never an id the page sends, and it is
+    # always checked: a page can't be trusted the way the app's own Plus door is. Its
+    # songs come from the same purchase as the phone's, so the two share one count.
+    account = g.web_account
+    if account or SONG_PLUS_REQUIRED:
+        refused = _song_plus_check(account or fields["rcUserId"])
         if isinstance(refused, tuple):
             _song_rate_refund()  # a refused song costs nothing, so it takes no rate slot
             return refused

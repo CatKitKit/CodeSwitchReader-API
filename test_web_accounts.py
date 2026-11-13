@@ -13,8 +13,11 @@ import subprocess
 import sys
 import threading
 import time
+import types
 import unittest
 from unittest.mock import Mock, patch
+
+from test_song_allowance import fake_firestore_module
 
 import app as api
 
@@ -398,12 +401,6 @@ class TierTest(AccountTestCase):
         for route in WEB_ROUTES:
             self.assertEqual(self.call(route, session=session).status_code, 400, route)
 
-    def test_songs_stay_app_only(self):
-        api.SONG_GENERATION_ENABLED = True
-        self.plus_accounts.add(ACCOUNT)
-        self.assertEqual(self.call("/song-bake", session=self.session()).status_code, 401)
-        self.assertEqual(self.call("/song-bake", key="app-key").status_code, 400)
-
     def test_the_app_is_never_asked_about_plus(self):
         self.assertEqual(self.call("/ai-proxy", key="app-key").status_code, 400)
         self.assertEqual(self.call("/ai-proxy", key="app-key", session="junk").status_code, 400,
@@ -529,6 +526,143 @@ class TierTest(AccountTestCase):
         with api._account_lock:
             api._account_plus_cache.clear()
         self.assertEqual(self.client.get("/account", headers=headers).get_json(), {"plus": None})
+
+
+class WebSongTest(AccountTestCase):
+    """Songs for a signed-in web account (mobile SIGNIN_PLAN step 8): the account is the
+    session's, Plus is always checked, and the count is the purchase's own, shared with the
+    phone. Firestore and Lyria are faked as in test_song_allowance."""
+
+    def setUp(self):
+        super().setUp()
+        self.song_saved = {name: getattr(api, name) for name in (
+            "SONG_PLUS_REQUIRED", "SONG_RATE_MAX_PER_WINDOW", "SONG_LOOKUP_MAX_PER_WINDOW",
+            "_firestore_client")}
+        api.SONG_GENERATION_ENABLED = True
+        api.SONG_PLUS_REQUIRED = True
+        api.SONG_RATE_MAX_PER_WINDOW = 100
+        api.SONG_LOOKUP_MAX_PER_WINDOW = 100
+        api._firestore_client = None
+        with api._song_rate_lock:
+            api._song_ip_hits.clear()
+            api._song_daily.update({"day": None, "count": 0})
+            api._song_lookup_hits.clear()
+        self.store = {}
+        firestore = fake_firestore_module(self.store)
+        cloud = types.ModuleType("google.cloud")
+        cloud.firestore = firestore
+        google = types.ModuleType("google")
+        google.cloud = cloud
+        self.modules = patch.dict(sys.modules, {
+            "google": google, "google.cloud": cloud, "google.cloud.firestore": firestore})
+        self.modules.start()
+        self.song_env = patch.dict("os.environ", {"LYRIA_API_KEY": "lyria-key"})
+        self.song_env.start()
+        self.lyria_calls = 0
+        self.lyria_response = StubResponse({"steps": [{"type": "model_output", "content": [{
+            "type": "audio", "mime_type": "audio/mpeg",
+            "data": base64.b64encode(b"ID3\x03\x00\x00song").decode("ascii")}]}]})
+        self.lyria = patch.object(api.requests, "post", self.fake_lyria)
+        self.lyria.start()
+
+    def tearDown(self):
+        self.lyria.stop()
+        self.song_env.stop()
+        self.modules.stop()
+        for name, value in self.song_saved.items():
+            setattr(api, name, value)
+        super().tearDown()
+
+    def fake_lyria(self, *args, **kwargs):
+        self.lyria_calls += 1
+        return self.lyria_response
+
+    def bake(self, session=None, key=None, rc_user_id=None):
+        payload = {"lyrics": "[Verse]\nLa la la.", "targetLanguage": "Spanish",
+                   "style": "pop", "mood": "playful"}
+        if rc_user_id is not None:
+            payload["rcUserId"] = rc_user_id
+        headers = {}
+        if session is not None:
+            headers["X-Account-Session"] = session
+        if key is not None:
+            headers["X-App-Key"] = key
+        return self.client.post("/song-bake", json=payload, headers=headers)
+
+    def count(self):
+        period = api._song_allowance_period(False)
+        return self.store.get(("song_allowance", f"sub_1__{period}"), {}).get("count", 0)
+
+    def test_a_plus_account_gets_a_song_and_hears_how_many_are_left(self):
+        self.plus_accounts.add(ACCOUNT)
+        response = self.bake(session=self.session())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["songsLeft"], api.SONG_PLUS_MONTHLY - 1)
+        self.assertEqual((self.lyria_calls, self.count()), (1, 1))
+
+    def test_a_free_account_is_refused_before_any_song_is_made(self):
+        refused = self.bake(session=self.session())
+        self.assertEqual(refused.status_code, 403)
+        self.assertTrue(refused.get_json()["plusRequired"])
+        self.assertEqual((self.lyria_calls, self.count()), (0, 0))
+
+    def test_an_account_is_checked_even_with_the_apps_switch_off(self):
+        api.SONG_PLUS_REQUIRED = False
+        self.assertEqual(self.bake(session=self.session()).status_code, 403)
+        self.assertEqual(self.lyria_calls, 0)
+        # The app itself is still let through unasked, as before.
+        asked = len(self.rc_calls)
+        self.assertEqual(self.bake(key="app-key").status_code, 200)
+        self.assertEqual(len(self.rc_calls), asked)
+
+    def test_the_account_is_the_sessions_never_an_id_the_page_sends(self):
+        other = "g_" + "ab" * 32
+        self.plus_accounts.add(other)  # somebody else has Plus
+        session = self.session()
+        asked = len(self.rc_calls)
+        refused = self.bake(session=session, rc_user_id=other)
+        self.assertEqual(refused.status_code, 403)
+        self.assertEqual(self.lyria_calls, 0)
+        self.assertTrue(all(ACCOUNT in url and other not in url for url in self.rc_calls[asked:]))
+
+    def test_phone_and_web_share_one_count(self):
+        self.plus_accounts.add(ACCOUNT)
+        session = self.session()
+        # The signed-in phone sends the account id with the app's key.
+        self.assertEqual(self.bake(key="app-key", rc_user_id=ACCOUNT).get_json()["songsLeft"],
+                         api.SONG_PLUS_MONTHLY - 1)
+        self.assertEqual(self.bake(session=session).get_json()["songsLeft"],
+                         api.SONG_PLUS_MONTHLY - 2)
+        self.assertEqual(self.count(), 2)
+
+    def test_a_used_up_month_is_refused_with_zero_left(self):
+        self.plus_accounts.add(ACCOUNT)
+        session = self.session()
+        self.store[("song_allowance", f"sub_1__{api._song_allowance_period(False)}")] = {
+            "count": api.SONG_PLUS_MONTHLY}
+        refused = self.bake(session=session)
+        self.assertEqual(refused.status_code, 429)
+        self.assertEqual(refused.get_json()["songsLeft"], 0)
+        self.assertEqual(self.lyria_calls, 0)
+
+    def test_a_song_that_fails_is_not_counted(self):
+        self.plus_accounts.add(ACCOUNT)
+        self.lyria_response = StubResponse({"error": {"code": "internal"}}, 500)
+        self.assertEqual(self.bake(session=self.session()).status_code, 502)
+        self.assertEqual((self.lyria_calls, self.count()), (1, 0))
+
+    def test_no_proof_or_a_bad_session_is_refused(self):
+        self.plus_accounts.add(ACCOUNT)
+        self.assertEqual(self.bake().status_code, 401)
+        self.assertEqual(self.bake(session="junk").status_code, 401)
+        self.assertEqual(self.lyria_calls, 0)
+
+    def test_switched_off_a_session_opens_nothing(self):
+        self.plus_accounts.add(ACCOUNT)
+        session = self.session()
+        api.WEB_ACCOUNTS_ENABLED = False
+        self.assertEqual(self.bake(session=session).status_code, 401)
+        self.assertEqual(self.lyria_calls, 0)
 
 
 class AccountLimitTest(AccountTestCase):
