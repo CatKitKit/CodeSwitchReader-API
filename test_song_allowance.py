@@ -269,7 +269,8 @@ class SongAllowanceTest(unittest.TestCase):
 
     def test_a_used_up_purchase_does_not_hide_another_with_songs_left(self):
         self.subscriptions = [
-            {"id": "sub_sandbox", "status": "active", "gives_access": True, "environment": "sandbox"},
+            {"id": "sub_sandbox", "status": "active", "gives_access": True, "environment": "sandbox",
+             "store": "play_store"},
             {"id": "sub_prod", "status": "active", "gives_access": True, "environment": "production"},
         ]
         for _ in range(5):
@@ -277,6 +278,23 @@ class SongAllowanceTest(unittest.TestCase):
         self.assertEqual(self.count("sub_prod"), 5, "production is used first")
         self.assertEqual(self.bake().status_code, 200)
         self.assertEqual(self.count("sub_sandbox"), 1)
+
+    def test_a_web_store_sandbox_purchase_is_never_plus(self):
+        # Anyone can "buy" in Stripe's or Paddle's sandbox with a public test card.
+        for store in ("stripe", "paddle", "rc_billing", None):
+            sub = {"id": "sub_free_card", "status": "active", "gives_access": True, "environment": "sandbox"}
+            if store:
+                sub["store"] = store
+            self.subscriptions = [sub]
+            self.assertEqual(self.bake().status_code, 403, f"sandbox {store} gives no Plus")
+        self.assertEqual(self.lyria_calls, 0)
+
+    def test_license_testers_and_the_test_store_still_count_and_real_web_purchases_do(self):
+        for store, environment in (("play_store", "sandbox"), ("test_store", "sandbox"),
+                                   ("stripe", "production")):
+            self.subscriptions = [{"id": f"sub_{store}", "status": "active", "gives_access": True,
+                                   "environment": environment, "store": store}]
+            self.assertEqual(self.bake().status_code, 200, f"{environment} {store} is Plus")
 
     def test_every_page_of_purchases_is_read(self):
         self.pages = [

@@ -457,6 +457,9 @@ def _song_upstream_error_code(response):
         return ""
 
 
+SANDBOX_PLUS_STORES = frozenset({"play_store", "test_store"})
+
+
 class SongAllowanceUnavailable(Exception):
     """RevenueCat or Firestore could not answer; the song is refused, never given free."""
 
@@ -465,8 +468,10 @@ def _plus_subscriptions(rc_user_id):
     """Every subscription that gives Plus now, as (id, in_free_trial), production first.
 
     gives_access is RevenueCat's own "should have access" flag; the project has one
-    entitlement, so any subscription that gives access is Plus. Sandbox counts too:
-    license testers' purchases are sandbox. All pages are read, so a long purchase
+    entitlement, so any subscription that gives access is Plus. Sandbox counts only from
+    SANDBOX_PLUS_STORES: Play's license testers (Kit's own list) and RevenueCat's Test Store
+    (its key ships nowhere). A web store's sandbox (Stripe, Paddle) is open to anyone with a
+    public test card, so it never gives Plus. All pages are read, so a long purchase
     history can't hide the live one (Sol 11/3).
     """
     key = os.environ.get("REVENUECAT_SECRET_KEY", "")
@@ -498,8 +503,10 @@ def _plus_subscriptions(rc_user_id):
             raise SongAllowanceUnavailable("RevenueCat sent an unexpected shape")
         for item in body.get("items") or []:
             if isinstance(item, dict) and item.get("gives_access") is True and item.get("id"):
-                found.append((str(item["id"]), item.get("status") == "trialing",
-                              item.get("environment") == "production"))
+                production = item.get("environment") == "production"
+                if not production and item.get("store") not in SANDBOX_PLUS_STORES:
+                    continue
+                found.append((str(item["id"]), item.get("status") == "trialing", production))
         next_page = body.get("next_page")
         if not next_page:
             complete = True
